@@ -1,7 +1,9 @@
-from telethon.sync import TelegramClient
+from telethon import TelegramClient
 
+api_id = 7605695437           # твой api_id
 api_id = 20533422       # твой api_id
 api_hash = '744e04f35f8aae6803294a5f3989c35b'  # твой api_hash
+client = TelegramClient('bot_session', api_id, api_hash).start(bot_token=bot_token)
 
 client = TelegramClient('session', api_id, api_hash)
 client.start()
