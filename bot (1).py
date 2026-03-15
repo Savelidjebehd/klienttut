@@ -1,3 +1,10 @@
+from telethon.sync import TelegramClient
+
+api_id = 20533422       # твой api_id
+api_hash = '744e04f35f8aae6803294a5f3989c35b'  # твой api_hash
+
+client = TelegramClient('session', api_id, api_hash)
+client.start()
 import asyncio
 import json
 import logging
