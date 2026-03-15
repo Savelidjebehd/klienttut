@@ -3,14 +3,9 @@ import json
 import logging
 import os
 import random
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Optional
 
-import requests
-from bs4 import BeautifulSoup
 from sqlalchemy import (
     Boolean,
     Column,
@@ -21,12 +16,13 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
-    func,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 from telethon import TelegramClient
+from telethon.tl.functions.contacts import SearchRequest
 from telethon.tl.functions.messages import GetHistoryRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import User, Channel, Chat
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -354,208 +350,7 @@ def db_set_round_robin_index(sphere_id: int, idx: int) -> None:
 
 
 # ===========================================================================
-# PARSER SOURCES  (поиск групп через внешние сайты)
-# ===========================================================================
-
-TELEGRAM_LINK_RE = re.compile(r"https?://t\.me/([a-zA-Z][a-zA-Z0-9_]{3,})")
-
-_HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-_REQUEST_TIMEOUT  = 15
-_RATE_LIMIT_DELAY = 2.0
-
-_BLACKLIST_EXACT = {
-    "joinchat", "share", "iv", "s", "addstickers",
-    "addtheme", "login", "confirmphone", "setlanguage",
-}
-_BLACKLIST_SUFFIXES = ("bot", "_bot")
-
-_SEED_AGGREGATORS = [
-    "groups_tg", "tgchats", "ru_groups", "best_tg_chats", "tgchat_search",
-]
-
-
-def _http_get(url: str, params: Optional[dict] = None) -> Optional[requests.Response]:
-    try:
-        resp = requests.get(url, headers=_HTTP_HEADERS, params=params, timeout=_REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp
-    except requests.RequestException as exc:
-        logger.warning("HTTP GET %s failed: %s", url, exc)
-        return None
-
-
-def _is_valid_group_username(username: str) -> bool:
-    u = username.lower()
-    if u in _BLACKLIST_EXACT:
-        return False
-    if any(u.endswith(s) for s in _BLACKLIST_SUFFIXES):
-        return False
-    if len(u) < 4:
-        return False
-    return True
-
-
-def _extract_tme_links(html: str) -> list[str]:
-    links: list[str] = []
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.find_all("a", href=True):
-        m = TELEGRAM_LINK_RE.match(tag["href"])
-        if m:
-            u = m.group(1).lower()
-            if _is_valid_group_username(u):
-                links.append(f"https://t.me/{u}")
-    for u in TELEGRAM_LINK_RE.findall(html):
-        u = u.lower()
-        if _is_valid_group_username(u):
-            candidate = f"https://t.me/{u}"
-            if candidate not in links:
-                links.append(candidate)
-    return list(dict.fromkeys(links))
-
-
-def _parse_tlgrm(keyword: str) -> list[str]:
-    links: list[str] = []
-    for page in range(1, 4):
-        resp = _http_get("https://tlgrm.ru/channels", params={"q": keyword, "page": page})
-        if resp is None:
-            break
-        soup = BeautifulSoup(resp.text, "html.parser")
-        cards = soup.select("a.channel-card__link, a[href*='t.me/'], a[href*='/channels/']")
-        for card in cards:
-            href: str = card.get("href", "")
-            if "t.me/" in href:
-                m = TELEGRAM_LINK_RE.search(href)
-                if m:
-                    u = m.group(1).lower()
-                    if _is_valid_group_username(u):
-                        links.append(f"https://t.me/{u}")
-            elif href.startswith("/channels/"):
-                parts = href.strip("/").split("/")
-                if len(parts) >= 2:
-                    u = parts[-1].lower()
-                    if _is_valid_group_username(u):
-                        links.append(f"https://t.me/{u}")
-        links.extend(_extract_tme_links(resp.text))
-        time.sleep(_RATE_LIMIT_DELAY)
-        if not cards:
-            break
-    result = list(dict.fromkeys(links))
-    logger.info("tlgrm.ru → %d links for '%s'", len(result), keyword)
-    return result
-
-
-def _parse_tgstat(keyword: str) -> list[str]:
-    links: list[str] = []
-    for page in range(1, 5):
-        resp = _http_get("https://tgstat.ru/search", params={"q": keyword, "page": page})
-        if resp is None:
-            break
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup.select("a[href]"):
-            href: str = tag["href"]
-            m = TELEGRAM_LINK_RE.search(href)
-            if m:
-                u = m.group(1).lower()
-                if _is_valid_group_username(u):
-                    links.append(f"https://t.me/{u}")
-            elif href.startswith("/channel/") or href.startswith("/chat/"):
-                parts = href.strip("/").split("/")
-                if len(parts) >= 2:
-                    u = parts[-1].lstrip("@").lower()
-                    if _is_valid_group_username(u):
-                        links.append(f"https://t.me/{u}")
-        links.extend(_extract_tme_links(resp.text))
-        time.sleep(_RATE_LIMIT_DELAY)
-        if not soup.select_one("a[rel='next'], .pagination .next"):
-            break
-    result = list(dict.fromkeys(links))
-    logger.info("tgstat.ru → %d links for '%s'", len(result), keyword)
-    return result
-
-
-def _parse_tme_aggregators(keyword: str) -> list[str]:
-    links: list[str] = []
-    kw_lower = keyword.lower()
-    for seed in _SEED_AGGREGATORS:
-        resp = _http_get(f"https://t.me/s/{seed}")
-        if resp is None:
-            continue
-        for link in _extract_tme_links(resp.text):
-            if kw_lower in link.lower():
-                links.append(link)
-        time.sleep(_RATE_LIMIT_DELAY)
-    result = list(dict.fromkeys(links))
-    logger.info("t.me/s/ → %d links for '%s'", len(result), keyword)
-    return result
-
-
-def scrape_all_sources(keyword: str) -> list[str]:
-    logger.info("Scraping sources for keyword: '%s'", keyword)
-    results: list[str] = []
-    results.extend(_parse_tlgrm(keyword))
-    results.extend(_parse_tgstat(keyword))
-    results.extend(_parse_tme_aggregators(keyword))
-    unique = list(dict.fromkeys(results))
-    logger.info("Total unique links for '%s': %d", keyword, len(unique))
-    return unique
-
-
-# ===========================================================================
-# GROUP FINDER
-# ===========================================================================
-
-_executor = ThreadPoolExecutor(max_workers=2)
-
-
-async def _scrape_async(keyword: str) -> list[str]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, scrape_all_sources, keyword)
-
-
-async def find_groups_for_sphere(
-    sphere_id: int,
-    sphere_name: str,
-    keywords: list[str],
-    min_groups: int = MIN_GROUPS_PER_SPHERE,
-    status_callback=None,
-) -> int:
-    current = db_count_groups(sphere_id)
-    if current >= min_groups:
-        logger.info("Sphere '%s' already has %d groups, skipping scrape.", sphere_name, current)
-        return current
-
-    all_links: list[str] = []
-    for keyword in keywords:
-        if db_count_groups(sphere_id) + len(all_links) >= min_groups:
-            break
-        logger.info("Searching groups for keyword '%s' (sphere '%s')", keyword, sphere_name)
-        try:
-            links = await _scrape_async(keyword)
-            all_links.extend(links)
-            if status_callback:
-                await status_callback(f"🔍 Ключевое слово «{keyword}»: найдено {len(links)} ссылок")
-        except Exception as exc:
-            logger.error("Error scraping keyword '%s': %s", keyword, exc)
-
-    unique_links = list(dict.fromkeys(all_links))
-    saved = db_save_groups(sphere_id, sphere_name, unique_links)
-    total = db_count_groups(sphere_id)
-
-    logger.info("Sphere '%s': saved %d new groups, total in DB: %d", sphere_name, saved, total)
-    if total < min_groups:
-        logger.warning("Sphere '%s': only %d groups found (target %d).", sphere_name, total, min_groups)
-    return total
-
-
-# ===========================================================================
-# TELETHON — CLIENT COLLECTION
+# TELETHON — клиент (единственный экземпляр)
 # ===========================================================================
 
 telethon_client: Optional[TelegramClient] = None
@@ -568,6 +363,100 @@ async def ensure_telethon() -> TelegramClient:
         await telethon_client.start(phone=PHONE)
     return telethon_client
 
+
+# ===========================================================================
+# GROUP FINDER — через Telethon SearchRequest (contacts.search)
+# ===========================================================================
+
+def _is_group_or_megagroup(chat) -> bool:
+    """Вернуть True если объект — группа или мегагруппа, но не канал и не бот."""
+    if isinstance(chat, Chat):
+        return True
+    if isinstance(chat, Channel):
+        return bool(getattr(chat, "megagroup", False))
+    return False
+
+
+async def _search_groups_by_keyword(
+    keyword: str,
+    limit: int = 100,
+) -> list[str]:
+    """
+    Ищет группы через Telegram API (contacts.Search).
+    Возвращает список username'ов в формате 'https://t.me/xxx'.
+    """
+    client = await ensure_telethon()
+    found: list[str] = []
+
+    try:
+        result = await client(SearchRequest(q=keyword, limit=limit))
+        for chat in result.chats:
+            if not _is_group_or_megagroup(chat):
+                continue
+            username = getattr(chat, "username", None)
+            if username:
+                found.append(f"https://t.me/{username.lower()}")
+        logger.info(
+            "contacts.Search '%s' → %d chats total, %d groups with username",
+            keyword, len(result.chats), len(found),
+        )
+    except Exception as exc:
+        logger.warning("SearchRequest failed for '%s': %s", keyword, exc)
+
+    return found
+
+
+async def find_groups_for_sphere(
+    sphere_id: int,
+    sphere_name: str,
+    keywords: list[str],
+    min_groups: int = MIN_GROUPS_PER_SPHERE,
+    status_callback=None,
+) -> int:
+    current = db_count_groups(sphere_id)
+    if current >= min_groups:
+        logger.info("Sphere '%s' already has %d groups, skipping search.", sphere_name, current)
+        return current
+
+    all_links: list[str] = []
+
+    for keyword in keywords:
+        if db_count_groups(sphere_id) + len(all_links) >= min_groups:
+            break
+        logger.info("Searching groups via Telegram API for keyword '%s'", keyword)
+        try:
+            links = await _search_groups_by_keyword(keyword, limit=100)
+            new_links = [l for l in links if l not in all_links]
+            all_links.extend(new_links)
+            if status_callback:
+                await status_callback(
+                    f"🔍 «{keyword}»: найдено {len(new_links)} групп "
+                    f"(всего накоплено: {len(all_links)})"
+                )
+            # небольшая пауза между запросами чтобы не флудить
+            await asyncio.sleep(1.5)
+        except Exception as exc:
+            logger.error("Error searching groups for keyword '%s': %s", keyword, exc)
+
+    unique_links = list(dict.fromkeys(all_links))
+    saved = db_save_groups(sphere_id, sphere_name, unique_links)
+    total = db_count_groups(sphere_id)
+
+    logger.info(
+        "Sphere '%s': saved %d new groups, total in DB: %d",
+        sphere_name, saved, total,
+    )
+    if total < min_groups:
+        logger.warning(
+            "Sphere '%s': only %d groups found (target %d). Add more keywords.",
+            sphere_name, total, min_groups,
+        )
+    return total
+
+
+# ===========================================================================
+# TELETHON — CLIENT COLLECTION
+# ===========================================================================
 
 def _user_matches_keywords(
     username: Optional[str],
@@ -585,9 +474,8 @@ def _user_matches_keywords(
 
 
 async def _get_user_bio(client: TelegramClient, user_id: int) -> str:
-    """Получить bio пользователя через getFullUser."""
+    """Получить bio пользователя через GetFullUserRequest."""
     try:
-        from telethon.tl.functions.users import GetFullUserRequest
         full = await client(GetFullUserRequest(user_id))
         return full.full_user.about or ""
     except Exception:
