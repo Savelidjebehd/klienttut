@@ -27,7 +27,6 @@ from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import User
 
@@ -618,66 +617,69 @@ async def _get_user_bio(client, uid) -> str:
     except Exception:
         return ""
 
-async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int = 500) -> int:
+async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int = 5000) -> int:
     """
-    Этап 1 — парсинг: собираем ВСЕХ в users_db без фильтра.
-    Боты удаляются сразу.
-    Для clients — фильтрация по user_keywords.
+    Парсинг через iter_messages (как в пользовательском парсере).
+    Работает через аккаунт пользователя — собирает ВСЕХ кто писал в группе.
+    Боты удаляются сразу. Фильтрация только для clients.
     """
     client   = await ensure_telethon()
     lookback = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
     seen_ids: set   = set()
     collected: list = []
+    count = 0
 
     try:
         entity = await client.get_entity(gu)
         await asyncio.sleep(0)
-        offset_id, total_fetched = 0, 0
 
-        while total_fetched < limit:
-            batch = min(100, limit - total_fetched)
-            history = await client(GetHistoryRequest(
-                peer=entity, limit=batch, offset_date=None,
-                offset_id=offset_id, max_id=0, min_id=0, add_offset=0, hash=0,
-            ))
-            await asyncio.sleep(0)
-            if not history.messages: break
-            stop = False
-            for msg in history.messages:
-                if not msg.date: continue
-                if msg.date.replace(tzinfo=None) < lookback: stop = True; break
-                if not getattr(msg, "from_id", None): continue
-                uid = getattr(msg.from_id, "user_id", None)
-                if not uid or uid in seen_ids: continue
-                seen_ids.add(uid)
-                try:
-                    user = await client.get_entity(uid)
-                    await asyncio.sleep(0)
-                    if not isinstance(user, User): continue
-                    if _is_bot(user): continue   # ← боты удаляются сразу
-                    bio = await _get_user_bio(client, uid)
-                    # Этап 1: все → users_db без фильтра
-                    db_save_user(sid, str(uid), user.username or "",
-                                 user.first_name or "", user.last_name or "", bio)
-                    # Для clients (показ менеджеру) — с фильтром по ключевым словам
-                    if user.username:
-                        un = user.username.lower()
-                        if not db_is_username_known(sid, un):
-                            h = " ".join(filter(None, [user.username, user.first_name, user.last_name, bio])).lower()
-                            if not user_keywords or any(k.lower() in h for k in user_keywords):
-                                collected.append(un)
-                except Exception:
-                    pass
-            total_fetched += len(history.messages)
-            offset_id      = history.messages[-1].id
-            if stop or len(history.messages) < batch: break
-            await asyncio.sleep(0.5)
+        # iter_messages — высокоуровневый итератор, работает через аккаунт
+        # собирает всех участников кто хотя бы раз написал сообщение
+        async for msg in client.iter_messages(entity, limit=limit):
+            # Отдаём управление event loop каждые 50 сообщений
+            count += 1
+            if count % 50 == 0:
+                await asyncio.sleep(0)
+
+            if not msg.date: continue
+            if msg.date.replace(tzinfo=None) < lookback: break
+
+            sender = msg.sender
+            if not sender: continue
+
+            uid = sender.id
+            if uid in seen_ids: continue
+            seen_ids.add(uid)
+
+            # Боты — удаляем сразу
+            if _is_bot(sender): continue
+
+            username   = getattr(sender, "username",   None) or ""
+            first_name = getattr(sender, "first_name", None) or ""
+            last_name  = getattr(sender, "last_name",  None) or ""
+
+            # Bio получаем только если нужна фильтрация — экономим запросы
+            bio = ""
+            if user_keywords:
+                bio = await _get_user_bio(client, uid)
+
+            # Этап 1: все → users_db без фильтра
+            db_save_user(sid, str(uid), username, first_name, last_name, bio)
+
+            # Для clients — с фильтром по ключевым словам
+            if username:
+                un = username.lower()
+                if not db_is_username_known(sid, un):
+                    h = " ".join(filter(None, [username, first_name, last_name, bio])).lower()
+                    if not user_keywords or any(k.lower() in h for k in user_keywords):
+                        collected.append(un)
+
     except Exception as exc:
         logger.warning("Error collecting «%s»: %s", gu, exc)
 
     saved = db_save_clients(sid, gu, collected)
     db_mark_group_parsed(f"https://t.me/{gu}")
-    logger.info("Collected %d clients + users_db from «%s»", saved, gu)
+    logger.info("iter_messages: %d unique users, %d clients saved from «%s»", len(seen_ids), saved, gu)
     return saved
 
 async def _fill_buffer_bg(sid: int, progress_message=None) -> None:
@@ -1448,15 +1450,18 @@ async def h_acc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {exc}"); return S_ACC_PHONE
 
 async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code   = update.message.text.strip().replace(" ", "")
-    phone  = context.user_data.get("new_acc_phone")
-    client = context.user_data.get("pyro_auth")
+    code        = update.message.text.strip().replace(" ", "")
+    phone       = context.user_data.get("new_acc_phone")
+    client      = context.user_data.get("pyro_auth")
+    phone_hash  = context.user_data.get("pyro_hash")
     if not client:
         await update.message.reply_text("Ошибка. Начните заново."); return S_ACCOUNTS
     try:
-        await client.sign_in(phone, code)
+        # Pyrogram v2 требует phone_code_hash явно
+        await client.sign_in(phone_number=phone, phone_code=code, phone_code_hash=phone_hash)
     except Exception as exc:
-        if "PASSWORD" in str(exc).upper():
+        err = str(exc).upper()
+        if "PASSWORD" in err or "SESSION_PASSWORD_NEEDED" in err:
             await update.message.reply_text(
                 "Введите облачный пароль (2FA):\nПример: Hgfd29",
                 reply_markup=ReplyKeyboardRemove(),
