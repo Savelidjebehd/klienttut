@@ -1363,7 +1363,12 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story()); return S_STORY
     if t == "➕ Добавить аккаунт":
         await update.message.reply_text(
-            "Введите номер телефона:\nПример: 79995559988",
+            "Вставьте session string аккаунта.\n\n"
+            "Как получить:\n"
+            "1. Скачайте get_session.py на свой компьютер\n"
+            "2. Запустите: python get_session.py\n"
+            "3. Введите телефон и код из Telegram\n"
+            "4. Скопируйте длинную строку и вставьте сюда",
             reply_markup=ReplyKeyboardRemove(),
         )
         return S_ACC_PHONE
@@ -1432,64 +1437,48 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return S_ACCOUNTS
 
 async def h_acc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip().replace("+", "").replace(" ", "")
-    if len(phone) < 10:
-        await update.message.reply_text("Неверный номер. Пример: 79995559988"); return S_ACC_PHONE
-    phone = "+" + phone
-    context.user_data["new_acc_phone"] = phone
-    await update.message.reply_text(f"📱 Отправляю код на {phone}...")
+    """
+    Добавление аккаунта через session string.
+    Пользователь запускает get_session.py локально и вставляет строку сюда.
+    """
+    session_str = update.message.text.strip()
+    if len(session_str) < 50:
+        await update.message.reply_text(
+            "Вставьте session string — длинную строку из get_session.py\n"
+            "(начинается с символов типа 1Ap... или 1Bv...)"
+        )
+        return S_ACC_PHONE
+    await update.message.reply_text("⏳ Проверяю сессию...")
     try:
-        client = PyrogramClient(f"pyro_auth_{phone}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
-        await client.connect()
-        sent = await client.send_code(phone)
-        context.user_data["pyro_auth"] = client
-        context.user_data["pyro_hash"] = sent.phone_code_hash
-        await update.message.reply_text("Введите код подтверждения:", reply_markup=ReplyKeyboardRemove())
-        return S_ACC_CODE
+        client = PyrogramClient(
+            name=f"acc_{abs(hash(session_str[:20])) % 999999}",
+            api_id=API_ID, api_hash=API_HASH,
+            session_string=session_str, in_memory=True,
+        )
+        await client.start()
+        me       = await client.get_me()
+        username = me.username or me.first_name or str(me.id)
+        phone    = str(getattr(me, "phone_number", None) or me.id)
+        await client.stop()
+        db_add_account(phone=phone, username=username, session_string=session_str)
+        await update.message.reply_text(
+            f"Аккаунт добавлен✅\n@{username}",
+            reply_markup=kb_accounts(db_get_accounts()),
+        )
+        return S_ACCOUNTS
     except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка: {exc}"); return S_ACC_PHONE
+        await update.message.reply_text(f"❌ Ошибка: {exc}\n\nПроверьте session string.")
+        return S_ACC_PHONE
 
 async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code        = update.message.text.strip().replace(" ", "")
-    phone       = context.user_data.get("new_acc_phone")
-    client      = context.user_data.get("pyro_auth")
-    phone_hash  = context.user_data.get("pyro_hash")
-    if not client:
-        await update.message.reply_text("Ошибка. Начните заново."); return S_ACCOUNTS
-    try:
-        # Pyrogram v2 требует phone_code_hash явно
-        await client.sign_in(phone_number=phone, phone_code=code, phone_code_hash=phone_hash)
-    except Exception as exc:
-        err = str(exc).upper()
-        if "PASSWORD" in err or "SESSION_PASSWORD_NEEDED" in err:
-            await update.message.reply_text(
-                "Введите облачный пароль (2FA):\nПример: Hgfd29",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return S_ACC_PASS
-        await update.message.reply_text(f"❌ Ошибка: {exc}"); return S_ACC_PHONE
-    return await _finish_acc(update, context, client, phone)
+    await update.message.reply_text("Вставьте session string:", reply_markup=ReplyKeyboardRemove())
+    return S_ACC_PHONE
 
 async def h_acc_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone  = context.user_data.get("new_acc_phone")
-    client = context.user_data.get("pyro_auth")
-    try:
-        await client.check_password(update.message.text.strip())
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Неверный пароль: {exc}"); return S_ACC_PASS
-    return await _finish_acc(update, context, client, phone)
+    await update.message.reply_text("Вставьте session string:", reply_markup=ReplyKeyboardRemove())
+    return S_ACC_PHONE
 
 async def _finish_acc(update, context, client, phone: str):
-    try:
-        ss = await client.export_session_string()
-        me = await client.get_me()
-        un = me.username or me.first_name or phone
-        await client.disconnect()
-        context.user_data.pop("pyro_auth", None)
-        db_add_account(phone=phone, username=un, session_string=ss)
-        await update.message.reply_text(f"Аккаунт добавлен✅\n@{un}", reply_markup=kb_accounts(db_get_accounts()))
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка: {exc}", reply_markup=kb_story())
     return S_ACCOUNTS
 
 # ===========================================================================
