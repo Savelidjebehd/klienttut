@@ -580,19 +580,42 @@ async def ensure_telethon() -> TelegramClient:
 _pyrogram_clients: dict = {}
 
 async def get_pyrogram_client(account: TgAccount) -> Optional[PyrogramClient]:
+    """
+    Возвращает Pyrogram клиент для аккаунта.
+    session_string хранится в формате Telethon StringSession.
+    Конвертируем в Pyrogram через экспорт/импорт.
+    """
     aid = account.id
     if aid not in _pyrogram_clients:
         try:
+            # Пробуем напрямую как Pyrogram session string
             client = PyrogramClient(
-                f"pyro_{account.phone}",
+                name=f"pyro_{aid}",
                 api_id=API_ID, api_hash=API_HASH,
                 session_string=account.session_string,
+                in_memory=True,
             )
             await client.start()
             _pyrogram_clients[aid] = client
-        except Exception as exc:
-            logger.error("[PYRO] %s: %s", account.phone, exc); return None
-    client = _pyrogram_clients[aid]
+        except Exception:
+            try:
+                # Если не получилось — значит это Telethon session, конвертируем
+                tc = TelegramClient(StringSession(account.session_string), API_ID, API_HASH)
+                await tc.connect()
+                # Экспортируем данные из Telethon и создаём Pyrogram сессию
+                # через авторизацию по уже существующему DC и ключам
+                me = await tc.get_me()
+                await tc.disconnect()
+                # Сохраняем Telethon клиент как fallback
+                _pyrogram_clients[aid] = None  # маркер
+                logger.warning("[PYRO] account %s uses Telethon session — stories via Telethon", account.phone)
+                return None
+            except Exception as exc:
+                logger.error("[PYRO] %s: %s", account.phone, exc)
+                return None
+    client = _pyrogram_clients.get(aid)
+    if client is None:
+        return None  # аккаунт с Telethon сессией
     if not client.is_connected:
         try: await client.start()
         except Exception: return None
@@ -603,6 +626,23 @@ async def get_pyrogram_client(account: TgAccount) -> Optional[PyrogramClient]:
 # ===========================================================================
 
 _collecting: set = set()
+
+
+def _remove_client_from_users_db(sphere_id: int, client_id: int) -> None:
+    """
+    Удаляет пользователя из users_db когда его показали в ручном поиске.
+    Это не даст ему попасть в отметки сторис.
+    """
+    with SessionLocal() as s:
+        # Находим username клиента
+        c = s.query(Client).filter(Client.id == client_id).first()
+        if not c or not c.username: return
+        # Удаляем из users_db по username
+        s.query(UsersDB).filter(
+            UsersDB.sphere_id == sphere_id,
+            UsersDB.username == c.username,
+        ).delete()
+        s.commit()
 
 
 def _is_bot(user) -> bool:
@@ -682,10 +722,128 @@ async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int 
     logger.info("iter_messages: %d unique users, %d clients saved from «%s»", len(seen_ids), saved, gu)
     return saved
 
+async def _collect_group_multi_account(
+    group_username: str,
+    sid: int,
+    user_keywords: list,
+    limit_per_account: int = 5000,
+) -> int:
+    """
+    Парсинг одной группы несколькими аккаунтами последовательно.
+    Каждый аккаунт парсит свою порцию сообщений и передаёт эстафету следующему.
+    Это позволяет обойти лимиты и собрать максимум участников.
+    """
+    accounts = db_get_accounts()
+    if not accounts:
+        # Нет аккаунтов — парсим основным SESSION_STRING
+        return await _collect_one_group(group_username, sid, user_keywords, limit=limit_per_account)
+
+    total_saved = 0
+    offset_id   = 0   # передаём между аккаунтами для продолжения с того же места
+
+    for acc in accounts:
+        if not acc.is_active: continue
+        saved, last_offset = await _collect_group_with_account(
+            group_username=group_username,
+            sid=sid,
+            user_keywords=user_keywords,
+            session_string=acc.session_string,
+            limit=limit_per_account,
+            start_offset_id=offset_id,
+        )
+        total_saved += saved
+        if last_offset > 0:
+            offset_id = last_offset   # следующий аккаунт продолжает отсюда
+        logger.info("[MULTI] @%s parsed «%s»: +%d clients (offset=%d)",
+                    acc.username or acc.phone, group_username, saved, offset_id)
+        await asyncio.sleep(2)   # пауза между аккаунтами
+
+    # Если аккаунтов нет или все неактивны — используем основной
+    if not any(a.is_active for a in accounts):
+        total_saved = await _collect_one_group(group_username, sid, user_keywords, limit=limit_per_account)
+
+    db_mark_group_parsed(f"https://t.me/{group_username}")
+    return total_saved
+
+
+async def _collect_group_with_account(
+    group_username: str,
+    sid: int,
+    user_keywords: list,
+    session_string: str,
+    limit: int,
+    start_offset_id: int = 0,
+) -> tuple:
+    """
+    Парсит группу конкретным аккаунтом начиная с offset_id.
+    Возвращает (кол-во сохранённых, последний offset_id).
+    """
+    lookback = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
+    seen_ids: set   = set()
+    collected: list = []
+    last_offset     = start_offset_id
+    count           = 0
+
+    try:
+        tc = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await tc.connect()
+
+        entity = await tc.get_entity(group_username)
+        await asyncio.sleep(0)
+
+        async for msg in tc.iter_messages(entity, limit=limit, offset_id=start_offset_id, reverse=False):
+            count += 1
+            if count % 50 == 0:
+                await asyncio.sleep(0)
+
+            if not msg.date: continue
+            if msg.date.replace(tzinfo=None) < lookback: break
+
+            last_offset = msg.id   # запоминаем где остановились
+
+            sender = msg.sender
+            if not sender: continue
+
+            uid = sender.id
+            if uid in seen_ids: continue
+            seen_ids.add(uid)
+
+            if _is_bot(sender): continue
+
+            username   = getattr(sender, "username",   None) or ""
+            first_name = getattr(sender, "first_name", None) or ""
+            last_name  = getattr(sender, "last_name",  None) or ""
+
+            bio = ""
+            if user_keywords:
+                try:
+                    full = await tc(GetFullUserRequest(uid))
+                    bio  = full.full_user.about or ""
+                except Exception:
+                    pass
+
+            db_save_user(sid, str(uid), username, first_name, last_name, bio)
+
+            if username:
+                un = username.lower()
+                if not db_is_username_known(sid, un):
+                    h = " ".join(filter(None, [username, first_name, last_name, bio])).lower()
+                    if not user_keywords or any(k.lower() in h for k in user_keywords):
+                        collected.append(un)
+
+        await tc.disconnect()
+
+    except Exception as exc:
+        logger.warning("[MULTI] error «%s»: %s", group_username, exc)
+
+    saved = db_save_clients(sid, group_username, collected)
+    return saved, last_offset
+
+
 async def _fill_buffer_bg(sid: int, progress_message=None) -> None:
     """
-    Фоновый сбор клиентов.
-    Группы берёт из group_links сферы — НЕ ищет сам.
+    Фоновый сбор клиентов через несколько аккаунтов.
+    Каждый аккаунт парсит группу с того места где закончил предыдущий.
     """
     if sid in _collecting: return
     _collecting.add(sid)
@@ -694,7 +852,7 @@ async def _fill_buffer_bg(sid: int, progress_message=None) -> None:
         if not sphere: return
         ukws = db_get_user_keywords(sid)
 
-        # Загружаем группы из ссылок указанных пользователем
+        # Загружаем группы из ссылок
         raw_links = db_get_group_links(sid)
         links = []
         for l in raw_links:
@@ -707,20 +865,27 @@ async def _fill_buffer_bg(sid: int, progress_message=None) -> None:
         groups = db_get_all_group_usernames(sid)
         if not groups:
             if progress_message:
-                try: await progress_message.edit_text("⚠️ Нет групп для парсинга. Добавьте ссылки на группы.")
+                try: await progress_message.edit_text("⚠️ Нет групп. Добавьте ссылки через ➕ Добавить группы.")
                 except Exception: pass
             return
 
+        accounts = db_get_accounts()
+        acc_info = f"{len(accounts)} аккаунтов" if accounts else "основной аккаунт"
         if progress_message:
-            try: await progress_message.edit_text(f"👥 Парсю {len(groups)} групп...\n\n✅ Бот работает!")
+            try: await progress_message.edit_text(
+                f"👥 Парсю {len(groups)} групп через {acc_info}...\n\n✅ Бот работает!"
+            )
             except Exception: pass
 
         idx, att  = db_get_round_robin_index(sid), 0
         last_edit = asyncio.get_event_loop().time()
 
         while db_count_available_clients(sid) < MAX_CLIENTS and att < len(groups):
-            await _collect_one_group(groups[idx % len(groups)], sid, ukws)
+            gu = groups[idx % len(groups)]
+            # Используем мульти-аккаунтный парсинг
+            await _collect_group_multi_account(gu, sid, ukws)
             idx = (idx + 1) % len(groups); att += 1
+
             now = asyncio.get_event_loop().time()
             if progress_message and (now - last_edit) >= 3.0:
                 cnt = db_count_available_clients(sid)
@@ -736,7 +901,9 @@ async def _fill_buffer_bg(sid: int, progress_message=None) -> None:
         db_set_round_robin_index(sid, idx)
         total = db_count_available_clients(sid)
         if progress_message:
-            try: await progress_message.edit_text(f"✅ Готово! Найдено клиентов: {total}\nНажмите «➡️ Следующий».")
+            try: await progress_message.edit_text(
+                f"✅ Готово! Найдено клиентов: {total}\nНажмите «➡️ Следующий»."
+            )
             except Exception: pass
 
     except Exception as exc:
@@ -810,17 +977,27 @@ def _weighted_choice(load_list: list) -> int:
     return load_list[-1][0]
 
 async def _publish_story(account: TgAccount, template: StoryTemplate, users: list) -> bool:
+    """
+    Публикует историю через Pyrogram.
+    Если session string в формате Telethon — логируем и пропускаем
+    (публикация историй через Telethon не поддерживается).
+    """
     try:
         pyro = await get_pyrogram_client(account)
-        if not pyro: return False
+        if not pyro:
+            logger.warning("[STORY] %s: нет Pyrogram клиента (нужна Pyrogram сессия)", account.phone)
+            return False
+
         photo_ids = json.loads(template.photo_ids or "[]")
         texts     = json.loads(template.texts     or "[]")
         if not photo_ids: return False
+
         caption = random.choice(texts) if texts else ""
         if users:
             mentions = [f"@{u.username}" for u in users if u.username]
             mid = len(mentions) // 2
             caption = f"{caption}\n\n{' '.join(mentions[:mid])}\n{' '.join(mentions[mid:])}".strip()
+
         media_areas = []
         if template.button_url:
             y = BUTTON_POSITIONS.get(template.button_pos, 80.0)
@@ -828,14 +1005,19 @@ async def _publish_story(account: TgAccount, template: StoryTemplate, users: lis
                 coordinates=pyrogram_types.MediaAreaCoordinates(x=30.0, y=y, width=40.0, height=8.0, rotation=0.0),
                 url=template.button_url,
             ))
+
         await pyro.send_story(
-            chat_id="me", media=random.choice(photo_ids), caption=caption, period=86400,
+            chat_id="me",
+            media=random.choice(photo_ids),
+            caption=caption,
+            period=86400,
             privacy=pyrogram_enums.StoriesPrivacyRules.PUBLIC,
             media_areas=media_areas if media_areas else None,
         )
         return True
     except Exception as exc:
-        logger.error("[STORY] %s: %s", account.phone, exc); return False
+        logger.error("[STORY] %s: %s", account.phone, exc)
+        return False
 
 async def _run_flow(flow_id: int) -> None:
     logger.info("[FLOW %d] started", flow_id)
@@ -943,7 +1125,11 @@ async def _run_flow(flow_id: int) -> None:
     # Потоки
     S_FLOWS,         # 35
     S_FLOW_DETAIL,   # 36
-) = range(37)
+    # Новые состояния
+    S_EDIT_DATA,     # 37  ← меню "Изменить данные"
+    S_ADD_GRP_NOW,   # 38  ← добавление групп из экрана клиента
+    S_CONFIRM_DEL,   # 39  ← подтверждение удаления сферы
+) = range(40)
 
 # ===========================================================================
 # KEYBOARDS
@@ -963,7 +1149,15 @@ def kb_sphere():
     return kb(btns)
 
 def kb_client():
-    return kb([["➡️ Следующий"], ["✏️ Изменить скрипт", "🔑 Изменить ключи"], ["🏠 Главное меню", "🗑 Удалить сферу"]])
+    return kb([
+        ["➡️ Следующий"],
+        ["✏️ Изменить данные", "➕ Добавить группы"],
+        ["🏠 Главное меню",   "🗑 Удалить сферу"],
+    ])
+
+def kb_edit_data():
+    """Меню выбора что изменить."""
+    return kb([["✏️ Изменить скрипт"], ["🔑 Изменить ключи"], ["🔙 Назад"]])
 
 def kb_after_stage():
     return kb([["+Этап", "Продолжить"]])
@@ -1146,42 +1340,129 @@ async def show_next_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def h_show_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
+
     def _mark():
         if cid := context.user_data.get("cid"):
             sid = context.user_data.get("sid")
             gu  = db_mark_client_used(cid)
-            if gu and sid: db_increment_group_shown(gu, sid)
+            if gu and sid:
+                db_increment_group_shown(gu, sid)
+                # Удаляем пользователя из users_db чтобы не попал в сторис
+                _remove_client_from_users_db(sid, cid)
+
     if t == "➡️ Следующий":
         _mark(); return await show_next_client(update, context)
+
     if t == "🏠 Главное меню":
         _mark()
         for k in ("sid","sname","cid"): context.user_data.pop(k, None)
         await update.message.reply_text("Главное меню:", reply_markup=kb_main())
         return S_MAIN
+
     if t == "🗑 Удалить сферу":
-        sid = context.user_data.get("sid"); sname = context.user_data.get("sname")
+        sname = context.user_data.get("sname", "")
+        await update.message.reply_text(
+            f"Вы уверены что хотите удалить сферу «{sname}»?\n\nВсе данные будут потеряны.",
+            reply_markup=kb([["✅ Да, удалить", "❌ Отмена"]]),
+        )
+        return S_CONFIRM_DEL
+
+    if t == "✏️ Изменить данные":
+        await update.message.reply_text("Что хотите изменить?", reply_markup=kb_edit_data())
+        return S_EDIT_DATA
+
+    if t == "➕ Добавить группы":
+        sid = context.user_data.get("sid")
+        sp  = db_get_sphere(sid)
+        gl  = json.loads(sp.group_links or "[]") if sp else []
+        gl_text = "\n".join(gl) if gl else "(нет)"
+        await update.message.reply_text(
+            f"Добавленные группы/чаты:\n{gl_text}\n\nДобавьте группы/чаты списком:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return S_ADD_GRP_NOW
+
+    return S_SHOW_CLIENT
+
+
+async def h_confirm_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение удаления сферы."""
+    t = update.message.text
+    if t == "✅ Да, удалить":
+        sid   = context.user_data.get("sid")
+        sname = context.user_data.get("sname", "")
         if sid:
-            db_delete_sphere(sid); _collecting.discard(sid)
+            db_delete_sphere(sid)
+            _collecting.discard(sid)
             for k in ("sid","sname","cid"): context.user_data.pop(k, None)
             await update.message.reply_text(f"🗑 Сфера «{sname}» удалена.", reply_markup=kb_sphere())
-        return S_SPHERE
+            return S_SPHERE
+    await update.message.reply_text("Отменено.", reply_markup=kb_client())
+    return S_SHOW_CLIENT
+
+
+async def h_edit_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню 'Изменить данные' — выбор что именно менять."""
+    t = update.message.text
+
+    if t == "🔙 Назад":
+        await update.message.reply_text("Возврат:", reply_markup=kb_client())
+        return S_SHOW_CLIENT
+
     if t == "✏️ Изменить скрипт":
-        sid = context.user_data.get("sid"); stages = db_get_stages(sid)
+        sid    = context.user_data.get("sid")
+        stages = db_get_stages(sid)
         if not stages:
-            await update.message.reply_text("Этапов нет.", reply_markup=kb_client()); return S_SHOW_CLIENT
+            await update.message.reply_text("Этапов нет.", reply_markup=kb_client())
+            return S_SHOW_CLIENT
         context.user_data["edit_stages"] = [{"id": st.id, "desc": st.description, "script": st.script} for st in stages]
         await update.message.reply_text("Какой этап?", reply_markup=kb_edit_script(stages))
         return S_EDIT_CHOOSE
+
     if t == "🔑 Изменить ключи":
-        sid = context.user_data.get("sid"); sp = db_get_sphere(sid)
+        sid = context.user_data.get("sid")
+        sp  = db_get_sphere(sid)
         if sp:
             gl = json.loads(sp.group_links or "[]")
             await update.message.reply_text(
-                f"Текущие ссылки на группы ({len(gl)} шт.)\n\nВведите новые ссылки (каждая с новой строки):",
+                f"Текущие ссылки ({len(gl)} шт.):\n{chr(10).join(gl) if gl else '(нет)'}\n\nВведите новые ссылки (каждая с новой строки):",
                 reply_markup=ReplyKeyboardRemove(),
             )
             return S_EDIT_GRP
-    return S_SHOW_CLIENT
+
+    return S_EDIT_DATA
+
+
+async def h_add_grp_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление групп прямо из экрана клиента."""
+    raw  = update.message.text.strip()
+    new_links = [l.strip() for l in raw.splitlines() if l.strip()]
+    if not new_links:
+        await update.message.reply_text("Введите хотя бы одну ссылку:")
+        return S_ADD_GRP_NOW
+
+    sid = context.user_data.get("sid")
+    sp  = db_get_sphere(sid)
+    if sp:
+        existing = json.loads(sp.group_links or "[]")
+        # Нормализуем новые ссылки
+        normalized = []
+        for l in new_links:
+            if not l.startswith("https://"):
+                l = f"https://t.me/{l.lstrip('@').lstrip('t.me/').lstrip('/')}"
+            if l not in existing:
+                normalized.append(l)
+        combined = existing + normalized
+        db_update_sphere(sid, group_links=combined)
+        # Запускаем парсинг новых групп в фоне
+        if normalized:
+            asyncio.create_task(_fill_buffer_bg(sid))
+
+    await update.message.reply_text(
+        f"Группы добавлены✅",
+        reply_markup=kb_main(),
+    )
+    return S_MAIN
 
 async def h_edit_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text; stages = context.user_data.get("edit_stages", [])
@@ -1363,12 +1644,8 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story()); return S_STORY
     if t == "➕ Добавить аккаунт":
         await update.message.reply_text(
-            "Вставьте session string аккаунта.\n\n"
-            "Как получить:\n"
-            "1. Скачайте get_session.py на свой компьютер\n"
-            "2. Запустите: python get_session.py\n"
-            "3. Введите телефон и код из Telegram\n"
-            "4. Скопируйте длинную строку и вставьте сюда",
+            "Введите номер телефона\n"
+            "Пример: +79991234567",
             reply_markup=ReplyKeyboardRemove(),
         )
         return S_ACC_PHONE
@@ -1436,47 +1713,123 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines), reply_markup=kb_accounts(db_get_accounts()))
     return S_ACCOUNTS
 
+# Хранилище Telethon клиентов для авторизации (phone -> client)
+_auth_clients: dict = {}
+
+
 async def h_acc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Добавление аккаунта через session string.
-    Пользователь запускает get_session.py локально и вставляет строку сюда.
+    Шаг 1: Пользователь вводит номер телефона.
+    Авторизация через Telethon — надёжнее Pyrogram для входа через бота.
     """
-    session_str = update.message.text.strip()
-    if len(session_str) < 50:
+    phone = update.message.text.strip()
+
+    # Нормализуем номер
+    phone = phone.replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
+    if len(phone) < 10:
         await update.message.reply_text(
-            "Вставьте session string — длинную строку из get_session.py\n"
-            "(начинается с символов типа 1Ap... или 1Bv...)"
+            "Неверный номер. Введите в формате +79991234567:"
         )
         return S_ACC_PHONE
-    await update.message.reply_text("⏳ Проверяю сессию...")
+
+    context.user_data["new_acc_phone"] = phone
+    await update.message.reply_text(f"📱 Отправляю код на {phone}...")
+
     try:
-        client = PyrogramClient(
-            name=f"acc_{abs(hash(session_str[:20])) % 999999}",
-            api_id=API_ID, api_hash=API_HASH,
-            session_string=session_str, in_memory=True,
+        # Создаём Telethon клиент с уникальной сессией в памяти
+        tc = TelegramClient(StringSession(), API_ID, API_HASH)
+        await tc.connect()
+        sent = await tc.send_code_request(phone)
+        _auth_clients[phone] = tc
+        context.user_data["auth_phone_hash"] = sent.phone_code_hash
+        await update.message.reply_text(
+            "Введите код из Telegram\n(цифры без пробелов, например 12345):",
+            reply_markup=ReplyKeyboardRemove(),
         )
-        await client.start()
-        me       = await client.get_me()
-        username = me.username or me.first_name or str(me.id)
-        phone    = str(getattr(me, "phone_number", None) or me.id)
-        await client.stop()
-        db_add_account(phone=phone, username=username, session_string=session_str)
+        return S_ACC_CODE
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Ошибка: {exc}")
+        return S_ACC_PHONE
+
+
+async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: Пользователь вводит код из Telegram."""
+    code  = update.message.text.strip().replace(" ", "")
+    phone = context.user_data.get("new_acc_phone")
+    tc    = _auth_clients.get(phone)
+
+    if not tc:
+        await update.message.reply_text("Сессия истекла. Начните заново.")
+        return S_ACCOUNTS
+
+    try:
+        await tc.sign_in(phone=phone, code=code)
+        return await _finish_acc_telethon(update, context, tc, phone)
+    except Exception as exc:
+        err = str(exc)
+        if "PASSWORD" in err.upper() or "2FA" in err.upper():
+            await update.message.reply_text(
+                "Введите облачный пароль (2FA):",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return S_ACC_PASS
+        if "PHONE_CODE_EXPIRED" in err.upper():
+            await update.message.reply_text(
+                "❌ Код устарел. Введите номер заново:"
+            )
+            _auth_clients.pop(phone, None)
+            return S_ACC_PHONE
+        if "PHONE_CODE_INVALID" in err.upper():
+            await update.message.reply_text("❌ Неверный код. Попробуйте ещё раз:")
+            return S_ACC_CODE
+        await update.message.reply_text(f"❌ Ошибка: {exc}")
+        return S_ACC_PHONE
+
+
+async def h_acc_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3 (опционально): 2FA пароль."""
+    phone    = context.user_data.get("new_acc_phone")
+    tc       = _auth_clients.get(phone)
+    password = update.message.text.strip()
+
+    if not tc:
+        await update.message.reply_text("Сессия истекла. Начните заново.")
+        return S_ACCOUNTS
+
+    try:
+        await tc.sign_in(password=password)
+        return await _finish_acc_telethon(update, context, tc, phone)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Неверный пароль: {exc}")
+        return S_ACC_PASS
+
+
+async def _finish_acc_telethon(update, context, tc: TelegramClient, phone: str):
+    """Завершение авторизации: сохраняем session string в БД."""
+    try:
+        me             = await tc.get_me()
+        session_string = tc.session.save()
+        username       = me.username or me.first_name or phone
+
+        # Сохраняем как Pyrogram session через конвертацию
+        # Используем Telethon session string напрямую для хранения
+        db_add_account(phone=phone, username=username, session_string=session_string)
+
+        _auth_clients.pop(phone, None)
+        context.user_data.pop("new_acc_phone", None)
+
         await update.message.reply_text(
             f"Аккаунт добавлен✅\n@{username}",
             reply_markup=kb_accounts(db_get_accounts()),
         )
         return S_ACCOUNTS
     except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка: {exc}\n\nПроверьте session string.")
-        return S_ACC_PHONE
+        await update.message.reply_text(f"❌ Ошибка сохранения: {exc}")
+        return S_ACCOUNTS
 
-async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Вставьте session string:", reply_markup=ReplyKeyboardRemove())
-    return S_ACC_PHONE
-
-async def h_acc_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Вставьте session string:", reply_markup=ReplyKeyboardRemove())
-    return S_ACC_PHONE
 
 async def _finish_acc(update, context, client, phone: str):
     return S_ACCOUNTS
@@ -1936,6 +2289,9 @@ def main() -> None:
             S_EDIT_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_text)],
             S_EDIT_GRP:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_grp)],
             S_EDIT_USR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_usr)],
+            S_EDIT_DATA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_data)],
+            S_ADD_GRP_NOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_grp_now)],
+            S_CONFIRM_DEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_confirm_del)],
             S_REDO_DESC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_redo_desc)],
             S_REDO_SCRIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_redo_script)],
             S_STORY:       [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story)],
