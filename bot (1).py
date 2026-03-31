@@ -1644,8 +1644,11 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story()); return S_STORY
     if t == "➕ Добавить аккаунт":
         await update.message.reply_text(
-            "Введите номер телефона\n"
-            "Пример: +79991234567",
+            "Вставьте session string аккаунта.\n\n"
+            "Как получить:\n"
+            "1. Запустите get_session.py на любом устройстве где есть доступ к Telegram\n"
+            "2. Введите телефон и код\n"
+            "3. Скопируйте длинную строку и вставьте сюда",
             reply_markup=ReplyKeyboardRemove(),
         )
         return S_ACC_PHONE
@@ -1713,122 +1716,68 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines), reply_markup=kb_accounts(db_get_accounts()))
     return S_ACCOUNTS
 
-# Хранилище Telethon клиентов для авторизации (phone -> client)
-_auth_clients: dict = {}
-
-
 async def h_acc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Шаг 1: Пользователь вводит номер телефона.
-    Авторизация через Telethon — надёжнее Pyrogram для входа через бота.
+    Добавление аккаунта через Telethon session string.
+    Пользователь получает строку через get_session.py и вставляет сюда.
     """
-    phone = update.message.text.strip()
+    session_str = update.message.text.strip()
 
-    # Нормализуем номер
-    phone = phone.replace(" ", "").replace("-", "")
-    if not phone.startswith("+"):
-        phone = "+" + phone
-
-    if len(phone) < 10:
+    if len(session_str) < 50:
         await update.message.reply_text(
-            "Неверный номер. Введите в формате +79991234567:"
+            "❌ Слишком короткая строка.\n\n"
+            "Вставьте session string целиком — он длинный (300+ символов)."
         )
         return S_ACC_PHONE
 
-    context.user_data["new_acc_phone"] = phone
-    await update.message.reply_text(f"📱 Отправляю код на {phone}...")
-
+    await update.message.reply_text("⏳ Проверяю сессию...")
     try:
-        # Создаём Telethon клиент с уникальной сессией в памяти
-        tc = TelegramClient(StringSession(), API_ID, API_HASH)
+        # Проверяем через Telethon
+        tc = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         await tc.connect()
-        sent = await tc.send_code_request(phone)
-        _auth_clients[phone] = tc
-        context.user_data["auth_phone_hash"] = sent.phone_code_hash
-        await update.message.reply_text(
-            "Введите код из Telegram\n(цифры без пробелов, например 12345):",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return S_ACC_CODE
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка: {exc}")
-        return S_ACC_PHONE
 
-
-async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 2: Пользователь вводит код из Telegram."""
-    code  = update.message.text.strip().replace(" ", "")
-    phone = context.user_data.get("new_acc_phone")
-    tc    = _auth_clients.get(phone)
-
-    if not tc:
-        await update.message.reply_text("Сессия истекла. Начните заново.")
-        return S_ACCOUNTS
-
-    try:
-        await tc.sign_in(phone=phone, code=code)
-        return await _finish_acc_telethon(update, context, tc, phone)
-    except Exception as exc:
-        err = str(exc)
-        if "PASSWORD" in err.upper() or "2FA" in err.upper():
+        if not await tc.is_user_authorized():
+            await tc.disconnect()
             await update.message.reply_text(
-                "Введите облачный пароль (2FA):",
-                reply_markup=ReplyKeyboardRemove(),
+                "❌ Сессия не авторизована.\n"
+                "Получите новый session string через get_session.py."
             )
-            return S_ACC_PASS
-        if "PHONE_CODE_EXPIRED" in err.upper():
-            await update.message.reply_text(
-                "❌ Код устарел. Введите номер заново:"
-            )
-            _auth_clients.pop(phone, None)
             return S_ACC_PHONE
-        if "PHONE_CODE_INVALID" in err.upper():
-            await update.message.reply_text("❌ Неверный код. Попробуйте ещё раз:")
-            return S_ACC_CODE
-        await update.message.reply_text(f"❌ Ошибка: {exc}")
-        return S_ACC_PHONE
 
+        me       = await tc.get_me()
+        username = me.username or me.first_name or str(me.id)
+        phone    = str(getattr(me, "phone", None) or me.id)
+        await tc.disconnect()
 
-async def h_acc_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 3 (опционально): 2FA пароль."""
-    phone    = context.user_data.get("new_acc_phone")
-    tc       = _auth_clients.get(phone)
-    password = update.message.text.strip()
-
-    if not tc:
-        await update.message.reply_text("Сессия истекла. Начните заново.")
-        return S_ACCOUNTS
-
-    try:
-        await tc.sign_in(password=password)
-        return await _finish_acc_telethon(update, context, tc, phone)
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Неверный пароль: {exc}")
-        return S_ACC_PASS
-
-
-async def _finish_acc_telethon(update, context, tc: TelegramClient, phone: str):
-    """Завершение авторизации: сохраняем session string в БД."""
-    try:
-        me             = await tc.get_me()
-        session_string = tc.session.save()
-        username       = me.username or me.first_name or phone
-
-        # Сохраняем как Pyrogram session через конвертацию
-        # Используем Telethon session string напрямую для хранения
-        db_add_account(phone=phone, username=username, session_string=session_string)
-
-        _auth_clients.pop(phone, None)
-        context.user_data.pop("new_acc_phone", None)
-
+        db_add_account(phone=phone, username=username, session_string=session_str)
         await update.message.reply_text(
             f"Аккаунт добавлен✅\n@{username}",
             reply_markup=kb_accounts(db_get_accounts()),
         )
         return S_ACCOUNTS
+
     except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка сохранения: {exc}")
-        return S_ACCOUNTS
+        await update.message.reply_text(
+            f"❌ Ошибка: {exc}\n\n"
+            "Проверьте что session string скопирован полностью."
+        )
+        return S_ACC_PHONE
+
+
+async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Заглушка — не используется при добавлении через session string
+    await update.message.reply_text(
+        "Вставьте session string:", reply_markup=ReplyKeyboardRemove()
+    )
+    return S_ACC_PHONE
+
+
+async def h_acc_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Заглушка
+    await update.message.reply_text(
+        "Вставьте session string:", reply_markup=ReplyKeyboardRemove()
+    )
+    return S_ACC_PHONE
 
 
 async def _finish_acc(update, context, client, phone: str):
