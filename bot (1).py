@@ -1718,50 +1718,94 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def h_acc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Добавление аккаунта через Telethon session string.
-    Пользователь получает строку через get_session.py и вставляет сюда.
+    Добавление аккаунта через session string.
+    Принимает строки от Telethon (get_session.py на базе Telethon)
+    и от Pyrogram (get_session.py на базе Pyrogram).
+    Автоматически определяет формат и проверяет сессию.
     """
     session_str = update.message.text.strip()
 
-    if len(session_str) < 50:
+    if len(session_str) < 20:
         await update.message.reply_text(
             "❌ Слишком короткая строка.\n\n"
-            "Вставьте session string целиком — он длинный (300+ символов)."
+            "Вставьте session string целиком."
         )
         return S_ACC_PHONE
 
     await update.message.reply_text("⏳ Проверяю сессию...")
+
+    username = None
+    phone    = None
+    saved_session = session_str
+
+    # Попытка 1: Telethon StringSession
     try:
-        # Проверяем через Telethon
         tc = TelegramClient(StringSession(session_str), API_ID, API_HASH)
         await tc.connect()
-
-        if not await tc.is_user_authorized():
+        if await tc.is_user_authorized():
+            me       = await tc.get_me()
+            username = me.username or me.first_name or str(me.id)
+            phone    = str(getattr(me, "phone", None) or me.id)
+            saved_session = session_str  # сохраняем как есть
             await tc.disconnect()
-            await update.message.reply_text(
-                "❌ Сессия не авторизована.\n"
-                "Получите новый session string через get_session.py."
+            logger.info("[ACC] Telethon session OK for @%s", username)
+        else:
+            await tc.disconnect()
+    except Exception as e1:
+        logger.info("[ACC] Telethon failed: %s", e1)
+        # Попытка 2: Pyrogram session string
+        try:
+            pyro = PyrogramClient(
+                name="check_session",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=session_str,
+                in_memory=True,
             )
-            return S_ACC_PHONE
+            await pyro.start()
+            me       = await pyro.get_me()
+            username = me.username or me.first_name or str(me.id)
+            phone    = str(getattr(me, "phone_number", None) or me.id)
+            saved_session = session_str
+            await pyro.stop()
+            logger.info("[ACC] Pyrogram session OK for @%s", username)
+        except Exception as e2:
+            logger.info("[ACC] Pyrogram failed: %s", e2)
+            # Попытка 3: может строка содержит лишние пробелы/переносы
+            clean = session_str.replace("\n", "").replace("\r", "").replace(" ", "")
+            if clean != session_str and len(clean) > 20:
+                try:
+                    tc2 = TelegramClient(StringSession(clean), API_ID, API_HASH)
+                    await tc2.connect()
+                    if await tc2.is_user_authorized():
+                        me       = await tc2.get_me()
+                        username = me.username or me.first_name or str(me.id)
+                        phone    = str(getattr(me, "phone", None) or me.id)
+                        saved_session = clean
+                        await tc2.disconnect()
+                        logger.info("[ACC] Telethon clean session OK for @%s", username)
+                    else:
+                        await tc2.disconnect()
+                except Exception as e3:
+                    logger.info("[ACC] All attempts failed: %s", e3)
 
-        me       = await tc.get_me()
-        username = me.username or me.first_name or str(me.id)
-        phone    = str(getattr(me, "phone", None) or me.id)
-        await tc.disconnect()
-
-        db_add_account(phone=phone, username=username, session_string=session_str)
+    if not username:
         await update.message.reply_text(
-            f"Аккаунт добавлен✅\n@{username}",
-            reply_markup=kb_accounts(db_get_accounts()),
-        )
-        return S_ACCOUNTS
-
-    except Exception as exc:
-        await update.message.reply_text(
-            f"❌ Ошибка: {exc}\n\n"
-            "Проверьте что session string скопирован полностью."
+            "❌ Не удалось проверить сессию.\n\n"
+            "Возможные причины:\n"
+            "• Строка скопирована не полностью\n"
+            "• Сессия устарела или отозвана\n"
+            "• Неверный формат\n\n"
+            "Создайте новую сессию через get_session.py и попробуйте снова."
         )
         return S_ACC_PHONE
+
+    db_add_account(phone=phone, username=username, session_string=saved_session)
+    await update.message.reply_text(
+        f"Аккаунт добавлен✅\n@{username}",
+        reply_markup=kb_accounts(db_get_accounts()),
+    )
+    return S_ACCOUNTS
 
 
 async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
