@@ -154,10 +154,11 @@ class TgAccount(Base):
     username       = Column(String,  nullable=True)
     session_string = Column(Text,    nullable=False)
     is_active      = Column(Boolean, default=True)
+    is_premium     = Column(Boolean, default=False)  # Telegram Premium
     stories_today  = Column(Integer, default=0)
     stories_total  = Column(Integer, default=0)
     tags_total     = Column(Integer, default=0)
-    avg_interval   = Column(Integer, default=0)   # средний интервал в минутах
+    avg_interval   = Column(Integer, default=0)
     last_story_at  = Column(DateTime, nullable=True)
     created_at     = Column(DateTime, default=datetime.utcnow)
     flow_accounts  = relationship("FlowAccount", back_populates="account", cascade="all, delete-orphan")
@@ -231,6 +232,7 @@ def init_db() -> None:
             "ALTER TABLE spheres ADD COLUMN group_links TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE spheres ADD COLUMN group_keywords TEXT",
             "ALTER TABLE tg_accounts ADD COLUMN avg_interval INTEGER DEFAULT 0",
+            "ALTER TABLE tg_accounts ADD COLUMN is_premium INTEGER DEFAULT 0",
         ]:
             try: conn.execute(text(sql)); conn.commit()
             except OperationalError: pass
@@ -442,12 +444,15 @@ def db_get_account(aid: int) -> Optional[TgAccount]:
         r = s.query(TgAccount).filter(TgAccount.id == aid).first()
         if r: s.expunge(r); return r
 
-def db_add_account(phone: str, username: str, session_string: str) -> int:
+def db_add_account(phone: str, username: str, session_string: str, is_premium: bool = False) -> int:
     with SessionLocal() as s:
         ex = s.query(TgAccount).filter(TgAccount.phone == phone).first()
         if ex:
-            ex.session_string = session_string; ex.username = username; s.commit(); return ex.id
-        obj = TgAccount(phone=phone, username=username, session_string=session_string)
+            ex.session_string = session_string
+            ex.username       = username
+            ex.is_premium     = is_premium
+            s.commit(); return ex.id
+        obj = TgAccount(phone=phone, username=username, session_string=session_string, is_premium=is_premium)
         s.add(obj); s.commit(); return obj.id
 
 def db_update_account_stats(aid: int, stories_delta: int = 0, tags_delta: int = 0, interval_min: int = 0) -> None:
@@ -564,39 +569,43 @@ def db_update_flow_stats(fid: int, sent: int, tagged: int, log_entry: str) -> No
 # TELETHON (парсинг)
 # ===========================================================================
 
-# Основной Pyrogram клиент для парсинга (SESSION_STRING)
-_main_pyro_client: Optional[PyrogramClient] = None
+# Кеш Pyrogram клиентов для парсинга (session_string -> client)
+_parser_clients: dict = {}
 
-async def ensure_pyro_parser() -> PyrogramClient:
-    """Возвращает основной Pyrogram клиент для парсинга."""
-    global _main_pyro_client
-    if _main_pyro_client is None:
-        _main_pyro_client = PyrogramClient(
-            name="main_parser",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_string=SESSION_STRING,
-            in_memory=True,
-        )
-    if not _main_pyro_client.is_connected:
-        await _main_pyro_client.start()
-    return _main_pyro_client
+async def ensure_pyro_parser() -> Optional[PyrogramClient]:
+    """Возвращает первый доступный активный Pyrogram клиент из добавленных аккаунтов."""
+    accounts = db_get_accounts()
+    if not accounts:
+        return None
+    for acc in accounts:
+        if not acc.is_active:
+            continue
+        client = await get_pyro_parser(acc.session_string)
+        if client:
+            return client
+    return None
 
 
 async def get_pyro_parser(session_string: str) -> Optional[PyrogramClient]:
-    """Создаёт Pyrogram клиент из session string для парсинга."""
+    """Создаёт или возвращает кешированный Pyrogram клиент из session string."""
+    key = session_string[:30]
+    if key in _parser_clients:
+        client = _parser_clients[key]
+        if client.is_connected:
+            return client
     try:
         client = PyrogramClient(
-            name=f"parser_{abs(hash(session_string[:20])) % 999999}",
+            name=f"parser_{abs(hash(key)) % 999999}",
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=session_string,
             in_memory=True,
         )
         await client.start()
+        _parser_clients[key] = client
         return client
     except Exception as exc:
-        logger.error("[PARSER] Failed to start client: %s", exc)
+        logger.error("[PARSER] Failed: %s", exc)
         return None
 
 # ===========================================================================
@@ -672,9 +681,12 @@ async def _get_user_bio_pyro(client: PyrogramClient, uid: int) -> str:
 async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int = 5000) -> int:
     """
     Парсинг через Pyrogram get_chat_history.
-    Работает с Pyrogram session string.
+    Требует хотя бы один добавленный аккаунт.
     """
     client = await ensure_pyro_parser()
+    if not client:
+        logger.warning("[PARSE] Нет аккаунтов для парсинга. Добавьте аккаунт через 👤 Аккаунты.")
+        return 0
     return await _parse_group_with_pyro(client, gu, sid, user_keywords, limit=limit)
 
 
@@ -785,9 +797,9 @@ async def _collect_group_multi_account(
                     acc.username or acc.phone, group_username, saved, offset_id)
         await asyncio.sleep(2)   # пауза между аккаунтами
 
-    # Если аккаунтов нет или все неактивны — используем основной
+    # Если аккаунтов нет или все неактивны — логируем
     if not any(a.is_active for a in accounts):
-        total_saved = await _collect_one_group(group_username, sid, user_keywords, limit=limit_per_account)
+        logger.warning("[MULTI] Нет активных аккаунтов для парсинга «%s»", group_username)
 
     db_mark_group_parsed(f"https://t.me/{group_username}")
     return total_saved
@@ -897,6 +909,16 @@ async def _fill_buffer_bg(sid: int, progress_message=None) -> None:
 
         accounts = db_get_accounts()
         acc_info = f"{len(accounts)} аккаунтов" if accounts else "основной аккаунт"
+        if not accounts:
+            if progress_message:
+                try: await progress_message.edit_text(
+                    "⚠️ Нет аккаунтов для парсинга!\n\n"
+                    "Добавьте аккаунт через:\n"
+                    "📸 Отметки сторис → 👤 Аккаунты → ➕ Добавить аккаунт"
+                )
+                except Exception: pass
+            return
+
         if progress_message:
             try: await progress_message.edit_text(
                 f"👥 Парсю {len(groups)} групп через {acc_info}...\n\n✅ Бот работает!"
@@ -1203,9 +1225,12 @@ def kb_story():
 def kb_accounts(accounts: list):
     btns = []
     for acc in accounts:
-        load   = db_get_account_load_pct(acc.id)
-        status = "🔴" if load > 70 else "🟢"
-        btns.append([f"{status} @{acc.username or acc.phone} [id:{acc.id}]"])
+        load    = db_get_account_load_pct(acc.id)
+        status  = "🔴" if load > 70 else "🟢"
+        premium = " ⭐️" if getattr(acc, "is_premium", False) else ""
+        # Храним id скрыто для идентификации при нажатии
+        label = f"{status} @{acc.username or acc.phone}{premium} [id:{acc.id}]"
+        btns.append([label])
     btns.append(["➕ Добавить аккаунт"])
     btns.append(["🔙 Назад"])
     return kb(btns)
@@ -1229,10 +1254,11 @@ def kb_btn_pos():
 def kb_select_accs(accounts: list, selected_ids: list):
     btns = []
     for acc in accounts:
-        mark = "✅" if acc.id in selected_ids else "◻️"
-        load = db_get_account_load_pct(acc.id)
-        st   = "🔴" if load > 70 else "🟢"
-        btns.append([f"{mark} {st} @{acc.username or acc.phone} нагрузка {load}% [id:{acc.id}]"])
+        mark    = "✅" if acc.id in selected_ids else "◻️"
+        load    = db_get_account_load_pct(acc.id)
+        st      = "🔴" if load > 70 else "🟢"
+        premium = " ⭐️" if getattr(acc, "is_premium", False) else ""
+        btns.append([f"{mark} {st} @{acc.username or acc.phone}{premium} нагрузка {load}% [id:{acc.id}]"])
     btns.append(["➡️ Продолжить"])
     btns.append(["🔙 Назад"])
     return kb(btns)
@@ -1687,17 +1713,21 @@ async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             load          = db_get_account_load_pct(acc.id)
             load_label    = "🔴 Высокий" if load > 70 else ("🟡 Умеренный" if load > 40 else "🟢 Низкий")
             last_story    = _minutes_ago(acc.last_story_at)
+            premium_str   = "⭐️ Premium" if getattr(acc, "is_premium", False) else "Обычный"
             warnings      = []
-            if load > 70:            warnings.append("• Высокая частота публикаций")
-            if (acc.avg_interval or 0) < 5: warnings.append("• Короткие интервалы")
-            if load > 80:            warnings.append("• Возможный риск ограничения")
+            if load > 70:                    warnings.append("• Высокая частота публикаций")
+            if (acc.avg_interval or 0) < 5:  warnings.append("• Короткие интервалы")
+            if load > 80:                    warnings.append("• Возможный риск ограничения")
+            if not getattr(acc, "is_premium", False):
+                warnings.append("• Нет Premium — публикация историй недоступна")
 
             flows_info = db_get_account_flows(acc.id)
             heavy_flow = max(flows_info, key=lambda f: f["stories_sent"], default=None) if flows_info else None
 
             card = (
                 f"Аккаунт: @{acc.username or acc.phone}\n"
-                f"Статус: {'Активен 🟢' if acc.is_active else 'Неактивен 🔴'}\n\n"
+                f"Статус: {'Активен 🟢' if acc.is_active else 'Неактивен 🔴'}\n"
+                f"Тип: {premium_str}\n\n"
                 f"Задействован в потоках: {total}\n"
                 f"Активных потоков: {active}\n\n"
                 f"📊 Уровень нагрузки: {load_label} ({load}%)\n\n"
