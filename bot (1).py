@@ -564,14 +564,40 @@ def db_update_flow_stats(fid: int, sent: int, tagged: int, log_entry: str) -> No
 # TELETHON (парсинг)
 # ===========================================================================
 
-telethon_client: Optional[TelegramClient] = None
+# Основной Pyrogram клиент для парсинга (SESSION_STRING)
+_main_pyro_client: Optional[PyrogramClient] = None
 
-async def ensure_telethon() -> TelegramClient:
-    global telethon_client
-    if telethon_client is None or not telethon_client.is_connected():
-        telethon_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-        await telethon_client.connect()
-    return telethon_client
+async def ensure_pyro_parser() -> PyrogramClient:
+    """Возвращает основной Pyrogram клиент для парсинга."""
+    global _main_pyro_client
+    if _main_pyro_client is None:
+        _main_pyro_client = PyrogramClient(
+            name="main_parser",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=SESSION_STRING,
+            in_memory=True,
+        )
+    if not _main_pyro_client.is_connected:
+        await _main_pyro_client.start()
+    return _main_pyro_client
+
+
+async def get_pyro_parser(session_string: str) -> Optional[PyrogramClient]:
+    """Создаёт Pyrogram клиент из session string для парсинга."""
+    try:
+        client = PyrogramClient(
+            name=f"parser_{abs(hash(session_string[:20])) % 999999}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_string,
+            in_memory=True,
+        )
+        await client.start()
+        return client
+    except Exception as exc:
+        logger.error("[PARSER] Failed to start client: %s", exc)
+        return None
 
 # ===========================================================================
 # PYROGRAM (публикация историй)
@@ -581,14 +607,12 @@ _pyrogram_clients: dict = {}
 
 async def get_pyrogram_client(account: TgAccount) -> Optional[PyrogramClient]:
     """
-    Возвращает Pyrogram клиент для аккаунта.
-    session_string хранится в формате Telethon StringSession.
-    Конвертируем в Pyrogram через экспорт/импорт.
+    Возвращает Pyrogram клиент для публикации историй.
+    session_string в формате Pyrogram.
     """
     aid = account.id
     if aid not in _pyrogram_clients:
         try:
-            # Пробуем напрямую как Pyrogram session string
             client = PyrogramClient(
                 name=f"pyro_{aid}",
                 api_id=API_ID, api_hash=API_HASH,
@@ -597,25 +621,12 @@ async def get_pyrogram_client(account: TgAccount) -> Optional[PyrogramClient]:
             )
             await client.start()
             _pyrogram_clients[aid] = client
-        except Exception:
-            try:
-                # Если не получилось — значит это Telethon session, конвертируем
-                tc = TelegramClient(StringSession(account.session_string), API_ID, API_HASH)
-                await tc.connect()
-                # Экспортируем данные из Telethon и создаём Pyrogram сессию
-                # через авторизацию по уже существующему DC и ключам
-                me = await tc.get_me()
-                await tc.disconnect()
-                # Сохраняем Telethon клиент как fallback
-                _pyrogram_clients[aid] = None  # маркер
-                logger.warning("[PYRO] account %s uses Telethon session — stories via Telethon", account.phone)
-                return None
-            except Exception as exc:
-                logger.error("[PYRO] %s: %s", account.phone, exc)
-                return None
+        except Exception as exc:
+            logger.error("[PYRO] %s: %s", account.phone, exc)
+            return None
     client = _pyrogram_clients.get(aid)
-    if client is None:
-        return None  # аккаунт с Telethon сессией
+    if not client:
+        return None
     if not client.is_connected:
         try: await client.start()
         except Exception: return None
@@ -650,63 +661,79 @@ def _is_bot(user) -> bool:
     un = (user.username or "").lower()
     return un.endswith("bot") or any(k in un for k in BOT_KEYWORDS)
 
-async def _get_user_bio(client, uid) -> str:
+async def _get_user_bio_pyro(client: PyrogramClient, uid: int) -> str:
+    """Получает bio пользователя через Pyrogram."""
     try:
-        full = await client(GetFullUserRequest(uid))
-        return full.full_user.about or ""
+        user = await client.get_users(uid)
+        return user.bio or "" if user else ""
     except Exception:
         return ""
 
 async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int = 5000) -> int:
     """
-    Парсинг через iter_messages (как в пользовательском парсере).
-    Работает через аккаунт пользователя — собирает ВСЕХ кто писал в группе.
-    Боты удаляются сразу. Фильтрация только для clients.
+    Парсинг через Pyrogram get_chat_history.
+    Работает с Pyrogram session string.
     """
-    client   = await ensure_telethon()
-    lookback = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
+    client = await ensure_pyro_parser()
+    return await _parse_group_with_pyro(client, gu, sid, user_keywords, limit=limit)
+
+
+async def _parse_group_with_pyro(
+    client: PyrogramClient,
+    gu: str,
+    sid: int,
+    user_keywords: list,
+    limit: int = 5000,
+    offset_id: int = 0,
+) -> int:
+    """
+    Парсит группу через Pyrogram.
+    Собирает всех кто писал, боты удаляются сразу.
+    """
+    lookback  = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
     seen_ids: set   = set()
     collected: list = []
-    count = 0
+    count           = 0
+    last_msg_id     = 0
 
     try:
-        entity = await client.get_entity(gu)
-        await asyncio.sleep(0)
+        # Нормализуем username
+        chat = gu if gu.startswith("@") else f"@{gu}"
 
-        # iter_messages — высокоуровневый итератор, работает через аккаунт
-        # собирает всех участников кто хотя бы раз написал сообщение
-        async for msg in client.iter_messages(entity, limit=limit):
-            # Отдаём управление event loop каждые 50 сообщений
+        async for msg in client.get_chat_history(chat, limit=limit, offset_id=offset_id):
             count += 1
-            if count % 50 == 0:
-                await asyncio.sleep(0)
+            if count % 100 == 0:
+                await asyncio.sleep(0)  # yield event loop
 
             if not msg.date: continue
             if msg.date.replace(tzinfo=None) < lookback: break
 
-            sender = msg.sender
+            last_msg_id = msg.id
+            sender = msg.from_user
             if not sender: continue
 
             uid = sender.id
             if uid in seen_ids: continue
             seen_ids.add(uid)
 
-            # Боты — удаляем сразу
-            if _is_bot(sender): continue
+            # Убираем ботов сразу
+            if getattr(sender, "is_bot", False): continue
+            un_check = (sender.username or "").lower()
+            if un_check.endswith("bot") or any(k in un_check for k in BOT_KEYWORDS):
+                continue
 
-            username   = getattr(sender, "username",   None) or ""
-            first_name = getattr(sender, "first_name", None) or ""
-            last_name  = getattr(sender, "last_name",  None) or ""
+            username   = sender.username   or ""
+            first_name = sender.first_name or ""
+            last_name  = sender.last_name  or ""
 
-            # Bio получаем только если нужна фильтрация — экономим запросы
             bio = ""
             if user_keywords:
-                bio = await _get_user_bio(client, uid)
+                bio = await _get_user_bio_pyro(client, uid)
 
-            # Этап 1: все → users_db без фильтра
+            # Сохраняем всех в users_db без фильтра
             db_save_user(sid, str(uid), username, first_name, last_name, bio)
 
-            # Для clients — с фильтром по ключевым словам
+            # Для clients — с фильтром
             if username:
                 un = username.lower()
                 if not db_is_username_known(sid, un):
@@ -715,11 +742,11 @@ async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int 
                         collected.append(un)
 
     except Exception as exc:
-        logger.warning("Error collecting «%s»: %s", gu, exc)
+        logger.warning("[PYRO PARSE] «%s»: %s", gu, exc)
 
     saved = db_save_clients(sid, gu, collected)
     db_mark_group_parsed(f"https://t.me/{gu}")
-    logger.info("iter_messages: %d unique users, %d clients saved from «%s»", len(seen_ids), saved, gu)
+    logger.info("[PYRO] %d unique, %d saved from «%s»", len(seen_ids), saved, gu)
     return saved
 
 async def _collect_group_multi_account(
@@ -775,52 +802,51 @@ async def _collect_group_with_account(
     start_offset_id: int = 0,
 ) -> tuple:
     """
-    Парсит группу конкретным аккаунтом начиная с offset_id.
-    Возвращает (кол-во сохранённых, последний offset_id).
+    Парсит группу конкретным Pyrogram аккаунтом начиная с offset_id.
+    Возвращает (кол-во сохранённых, последний msg_id).
     """
-    lookback = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
+    lookback  = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
     seen_ids: set   = set()
     collected: list = []
     last_offset     = start_offset_id
     count           = 0
 
     try:
-        tc = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await tc.connect()
+        client = await get_pyro_parser(session_string)
+        if not client:
+            return 0, start_offset_id
 
-        entity = await tc.get_entity(group_username)
-        await asyncio.sleep(0)
+        chat = group_username if group_username.startswith("@") else f"@{group_username}"
 
-        async for msg in tc.iter_messages(entity, limit=limit, offset_id=start_offset_id, reverse=False):
+        async for msg in client.get_chat_history(chat, limit=limit, offset_id=start_offset_id):
             count += 1
-            if count % 50 == 0:
+            if count % 100 == 0:
                 await asyncio.sleep(0)
 
             if not msg.date: continue
             if msg.date.replace(tzinfo=None) < lookback: break
 
-            last_offset = msg.id   # запоминаем где остановились
+            last_offset = msg.id
 
-            sender = msg.sender
+            sender = msg.from_user
             if not sender: continue
 
             uid = sender.id
             if uid in seen_ids: continue
             seen_ids.add(uid)
 
-            if _is_bot(sender): continue
+            if getattr(sender, "is_bot", False): continue
+            un_check = (sender.username or "").lower()
+            if un_check.endswith("bot") or any(k in un_check for k in BOT_KEYWORDS):
+                continue
 
-            username   = getattr(sender, "username",   None) or ""
-            first_name = getattr(sender, "first_name", None) or ""
-            last_name  = getattr(sender, "last_name",  None) or ""
+            username   = sender.username   or ""
+            first_name = sender.first_name or ""
+            last_name  = sender.last_name  or ""
 
             bio = ""
             if user_keywords:
-                try:
-                    full = await tc(GetFullUserRequest(uid))
-                    bio  = full.full_user.about or ""
-                except Exception:
-                    pass
+                bio = await _get_user_bio_pyro(client, uid)
 
             db_save_user(sid, str(uid), username, first_name, last_name, bio)
 
@@ -831,10 +857,10 @@ async def _collect_group_with_account(
                     if not user_keywords or any(k.lower() in h for k in user_keywords):
                         collected.append(un)
 
-        await tc.disconnect()
+        await client.stop()
 
     except Exception as exc:
-        logger.warning("[MULTI] error «%s»: %s", group_username, exc)
+        logger.warning("[MULTI PYRO] «%s»: %s", group_username, exc)
 
     saved = db_save_clients(sid, group_username, collected)
     return saved, last_offset
