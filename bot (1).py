@@ -25,7 +25,9 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
-from telethon import TelegramClient
+import urllib.parse
+
+from telethon import TelegramClient, functions, types as telethon_types
 from telethon.sessions import StringSession
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import User
@@ -61,7 +63,8 @@ CLIENT_TTL_DAYS       = 30
 MESSAGE_LOOKBACK_DAYS = 730   # 2 года
 BG_CHECK_INTERVAL     = 120
 
-BUTTON_POSITIONS = {"top": 15.0, "center": 50.0, "bottom": 80.0}
+# Координаты кнопки для Telethon SendStoryRequest (0.0–1.0)
+BUTTON_POSITIONS = {"top": 0.20, "center": 0.50, "bottom": 0.85}
 BOT_KEYWORDS     = ["bot", "support", "notify", "news", "official", "info", "help", "admin", "channel"]
 
 # ===========================================================================
@@ -171,9 +174,10 @@ class StoryTemplate(Base):
     name        = Column(String,  nullable=False)
     photo_ids   = Column(Text,    nullable=False, default="[]")
     texts       = Column(Text,    nullable=False, default="[]")
-    button_text = Column(String,  nullable=True)
-    button_url  = Column(String,  nullable=True)
-    button_pos  = Column(String,  nullable=False, default="bottom")
+    button_text         = Column(String, nullable=True)
+    button_url          = Column(String, nullable=True)
+    button_message_text = Column(String, nullable=True)  # текст подставляемый в ЛС
+    button_pos          = Column(String, nullable=False, default="bottom")
     created_at  = Column(DateTime, default=datetime.utcnow)
     flows = relationship("StoryFlow", back_populates="template", cascade="all, delete-orphan")
 
@@ -233,6 +237,7 @@ def init_db() -> None:
             "ALTER TABLE spheres ADD COLUMN group_keywords TEXT",
             "ALTER TABLE tg_accounts ADD COLUMN avg_interval INTEGER DEFAULT 0",
             "ALTER TABLE tg_accounts ADD COLUMN is_premium INTEGER DEFAULT 0",
+            "ALTER TABLE story_templates ADD COLUMN button_message_text TEXT",
         ]:
             try: conn.execute(text(sql)); conn.commit()
             except OperationalError: pass
@@ -1024,48 +1029,146 @@ def _weighted_choice(load_list: list) -> int:
         if r < acc_sum: return aid
     return load_list[-1][0]
 
-async def _publish_story(account: TgAccount, template: StoryTemplate, users: list) -> bool:
+async def _get_telethon_client(account: TgAccount) -> Optional[TelegramClient]:
     """
-    Публикует историю через Pyrogram.
-    Если session string в формате Telethon — логируем и пропускаем
-    (публикация историй через Telethon не поддерживается).
+    Возвращает Telethon клиент для аккаунта.
+    Используется для публикации историй через raw API (SendStoryRequest).
     """
     try:
-        pyro = await get_pyrogram_client(account)
-        if not pyro:
-            logger.warning("[STORY] %s: нет Pyrogram клиента (нужна Pyrogram сессия)", account.phone)
+        tc = TelegramClient(
+            StringSession(account.session_string),
+            API_ID, API_HASH,
+        )
+        await tc.connect()
+        if not await tc.is_user_authorized():
+            await tc.disconnect()
+            logger.warning("[TELETHON] %s: не авторизован", account.phone)
+            return None
+        return tc
+    except Exception as exc:
+        logger.error("[TELETHON] %s: %s", account.phone, exc)
+        return None
+
+
+def _build_button_url(account: TgAccount, template: StoryTemplate) -> Optional[str]:
+    """
+    Формирует URL кнопки в формате https://t.me/username?text=encoded_text
+    Использует URL encoding для текста в ЛС.
+    """
+    username = account.username
+    if not username:
+        return None
+
+    msg_text = getattr(template, "button_message_text", None) or ""
+    if not msg_text:
+        # Если текст для ЛС не задан — просто ссылка на профиль
+        return f"https://t.me/{username}"
+
+    encoded = urllib.parse.quote(msg_text, safe="")
+    url = f"https://t.me/{username}?text={encoded}"
+    logger.info("[STORY] Button URL: %s", url)
+    return url
+
+
+async def _publish_story(account: TgAccount, template: StoryTemplate, users: list) -> bool:
+    """
+    Публикует историю через Telethon raw API (functions.stories.SendStoryRequest).
+    Кнопка реализована через types.MediaAreaUrl с координатами 0.0–1.0.
+    Текст в ЛС подставляется через URL encoding.
+    """
+    tc = None
+    try:
+        tc = await _get_telethon_client(account)
+        if not tc:
             return False
 
         photo_ids = json.loads(template.photo_ids or "[]")
         texts     = json.loads(template.texts     or "[]")
-        if not photo_ids: return False
+        if not photo_ids:
+            logger.warning("[STORY] %s: нет фото в шаблоне", account.phone)
+            return False
 
+        # Случайный текст подписи
         caption = random.choice(texts) if texts else ""
+
+        # Добавляем отметки пользователей в подпись
         if users:
             mentions = [f"@{u.username}" for u in users if u.username]
-            mid = len(mentions) // 2
-            caption = f"{caption}\n\n{' '.join(mentions[:mid])}\n{' '.join(mentions[mid:])}".strip()
+            mid      = len(mentions) // 2
+            line1    = " ".join(mentions[:mid])
+            line2    = " ".join(mentions[mid:])
+            caption  = f"{caption}\n\n{line1}\n{line2}".strip()
 
-        media_areas = []
-        if template.button_url:
-            y = BUTTON_POSITIONS.get(template.button_pos, 80.0)
-            media_areas.append(pyrogram_types.MediaAreaUrl(
-                coordinates=pyrogram_types.MediaAreaCoordinates(x=30.0, y=y, width=40.0, height=8.0, rotation=0.0),
-                url=template.button_url,
-            ))
+        # Загружаем фото через Telethon
+        photo_file_id = random.choice(photo_ids)
+        logger.info("[STORY] %s: загружаю фото %s", account.phone, photo_file_id)
 
-        await pyro.send_story(
-            chat_id="me",
-            media=random.choice(photo_ids),
-            caption=caption,
-            period=86400,
-            privacy=pyrogram_enums.StoriesPrivacyRules.PUBLIC,
-            media_areas=media_areas if media_areas else None,
+        # Скачиваем фото по file_id через Pyrogram, потом загружаем через Telethon
+        pyro = await get_pyrogram_client(account)
+        if not pyro:
+            logger.warning("[STORY] %s: нет Pyrogram клиента для скачивания фото", account.phone)
+            await tc.disconnect()
+            return False
+
+        # Скачиваем фото в память
+        photo_bytes = await pyro.download_media(photo_file_id, in_memory=True)
+        if not photo_bytes:
+            logger.warning("[STORY] %s: не удалось скачать фото", account.phone)
+            await tc.disconnect()
+            return False
+
+        # Загружаем через Telethon
+        import io
+        uploaded = await tc.upload_file(
+            io.BytesIO(bytes(photo_bytes)),
+            file_name="story.jpg",
         )
+        media = telethon_types.InputMediaUploadedPhoto(file=uploaded)
+
+        # Строим кнопку MediaAreaUrl
+        media_areas = []
+        button_url  = _build_button_url(account, template)
+        if button_url:
+            pos_y = BUTTON_POSITIONS.get(template.button_pos, 0.85)
+            area  = telethon_types.MediaAreaUrl(
+                coordinates=telethon_types.MediaAreaCoordinates(
+                    x=0.2,       # отступ слева 20%
+                    y=pos_y,     # вертикальное положение
+                    w=0.6,       # ширина 60%
+                    h=0.12,      # высота 12%
+                    rotation=0.0,
+                ),
+                url=button_url,
+            )
+            media_areas.append(area)
+            logger.info(
+                "[STORY] %s: кнопка pos=%s y=%.2f url=%s",
+                account.phone, template.button_pos, pos_y, button_url,
+            )
+
+        # Публикуем через Telethon raw API
+        await tc(functions.stories.SendStoryRequest(
+            peer=await tc.get_me(),
+            media=media,
+            caption=caption,
+            media_areas=media_areas if media_areas else None,
+            period=86400,           # 24 часа
+            privacy_rules=[telethon_types.InputPrivacyValueAllowAll()],
+            random_id=random.randint(0, 2**31),
+            pinned=False,
+            noforwards=False,
+        ))
+
+        logger.info("[STORY] %s: история опубликована (%d отметок)", account.phone, len(users))
         return True
+
     except Exception as exc:
         logger.error("[STORY] %s: %s", account.phone, exc)
         return False
+    finally:
+        if tc:
+            try: await tc.disconnect()
+            except Exception: pass
 
 async def _run_flow(flow_id: int) -> None:
     logger.info("[FLOW %d] started", flow_id)
@@ -1950,22 +2053,50 @@ async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texts = [t.strip() for t in update.message.text.strip().splitlines() if t.strip()]
     if not texts: await update.message.reply_text("Введите хотя бы один текст:"); return S_TEXT
     db_update_template(context.user_data["story_tid"], texts=json.dumps(texts, ensure_ascii=False))
-    await update.message.reply_text(f"✅ Текстов: {len(texts)}\n\nТекст кнопки (или «пропустить»):", reply_markup=kb([["пропустить"]]))
+    await update.message.reply_text(
+        f"✅ Текстов: {len(texts)}\n\n"
+        f"Введите текст кнопки (то что видит пользователь)\n"
+        f"Пример: ЖМИ\n\n"
+        f"Или «пропустить» если кнопка не нужна:",
+        reply_markup=kb([["пропустить"]]),
+    )
     return S_BTN_TEXT
 
 async def h_btn_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: текст кнопки (для отображения в превью)."""
     t = update.message.text.strip()
     if t.lower() == "пропустить":
-        await update.message.reply_text("Выберите режим:", reply_markup=kb_modes(db_get_modes())); return S_MODE
+        await update.message.reply_text("Выберите режим:", reply_markup=kb_modes(db_get_modes()))
+        return S_MODE
     context.user_data["story_btn_text"] = t
-    await update.message.reply_text("Введите ваш username (без @):", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        f"Текст кнопки: «{t}»\n\n"
+        f"Теперь введите текст который подставится в ЛС когда пользователь нажмёт кнопку\n\n"
+        f"Пример: Привет, хочу записаться!",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return S_BTN_MSG
 
 async def h_btn_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.text.strip().lstrip("@")
-    url = f"https://t.me/{username}"
-    db_update_template(context.user_data["story_tid"], button_text=context.user_data.get("story_btn_text",""), button_url=url)
-    await update.message.reply_text(f"Ссылка: {url}\n\nПоложение кнопки:", reply_markup=kb_btn_pos())
+    """Шаг: пользователь вводит текст который подставится в ЛС при нажатии кнопки."""
+    msg_text = update.message.text.strip()
+    context.user_data["story_btn_msg_text"] = msg_text
+
+    # Сохраняем текст для ЛС в шаблон
+    db_update_template(
+        context.user_data["story_tid"],
+        button_text=context.user_data.get("story_btn_text", ""),
+        button_message_text=msg_text,
+    )
+
+    # Показываем превью ссылки
+    preview_url = f"https://t.me/yourname?text={urllib.parse.quote(msg_text, safe='')}"
+    await update.message.reply_text(
+        f"✅ Текст в ЛС сохранён!\n\n"
+        f"Пример ссылки:\n{preview_url}\n\n"
+        f"Положение кнопки:",
+        reply_markup=kb_btn_pos(),
+    )
     return S_BTN_POS
 
 async def h_btn_pos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2182,7 +2313,9 @@ async def _show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Предпросмотр🔒\n\n"
         f"📋 Шаблон: {tmpl.name}\n"
         f"📷 Фото: {len(photos)} шт. | 💬 Текстов: {len(texts)}\n"
-        f"🔗 Кнопка: {tmpl.button_url or 'нет'} ({tmpl.button_pos})\n\n"
+        f"🔗 Кнопка: {tmpl.button_text or 'нет'}\n"
+        f"💬 Текст в ЛС: {getattr(tmpl, 'button_message_text', None) or 'нет'}\n"
+        f"📍 Позиция: {tmpl.button_pos}\n\n"
         f"{'—'*30}\n\n"
         f"Кнопка\n{tmpl.button_url or '—'}\n\n"
         f"{'—'*30}\n\n"
