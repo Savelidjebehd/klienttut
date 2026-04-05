@@ -11,6 +11,7 @@ Telegram-бот: поиск клиентов + автопостинг стори
 """
 
 import asyncio
+import os
 import json
 import logging
 import random
@@ -230,6 +231,7 @@ class FlowAccount(Base):
 
 
 def init_db() -> None:
+    os.makedirs("media/photos", exist_ok=True)
     Base.metadata.create_all(bind=engine)
     # Безопасная миграция существующих БД
     with engine.connect() as conn:
@@ -1126,31 +1128,18 @@ async def _publish_story(account: TgAccount, template: StoryTemplate, users: lis
             line2    = " ".join(mentions[mid:])
             caption  = f"{caption}\n\n{line1}\n{line2}".strip()
 
-        # Загружаем фото через Telethon
-        photo_file_id = random.choice(photo_ids)
-        logger.info("[STORY] %s: загружаю фото %s", account.phone, photo_file_id)
+        # Выбираем случайный путь к фото (локальный файл)
+        photo_path = random.choice(photo_ids)
+        logger.info("[STORY] %s: загружаю фото из %s", account.phone, photo_path)
 
-        # Скачиваем фото по file_id через Pyrogram, потом загружаем через Telethon
-        pyro = await get_pyrogram_client(account)
-        if not pyro:
-            logger.warning("[STORY] %s: нет Pyrogram клиента для скачивания фото", account.phone)
+        if not os.path.exists(photo_path):
+            logger.error("[STORY] %s: файл не найден: %s", account.phone, photo_path)
             await tc.disconnect()
             return False
 
-        # Скачиваем фото в память
-        photo_bytes = await pyro.download_media(photo_file_id, in_memory=True)
-        if not photo_bytes:
-            logger.warning("[STORY] %s: не удалось скачать фото", account.phone)
-            await tc.disconnect()
-            return False
-
-        # Загружаем через Telethon
-        import io
-        uploaded = await tc.upload_file(
-            io.BytesIO(bytes(photo_bytes)),
-            file_name="story.jpg",
-        )
-        media = telethon_types.InputMediaUploadedPhoto(file=uploaded)
+        # Загружаем локальный файл через Telethon upload_file
+        uploaded = await tc.upload_file(photo_path)
+        media    = telethon_types.InputMediaUploadedPhoto(file=uploaded)
 
         # Строим кнопку MediaAreaUrl
         media_areas = []
@@ -2094,17 +2083,39 @@ async def h_new_tmpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return S_PHOTO
 
 async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принимает фото, скачивает через Bot API и сохраняет локально.
+    Хранит путь к файлу вместо file_id — Telethon работает только с файлами.
+    """
     if update.message.text and update.message.text.lower() == "готово":
         photos = context.user_data.get("story_photos", [])
-        if not photos: await update.message.reply_text("Добавьте хотя бы одно фото!"); return S_PHOTO
+        if not photos:
+            await update.message.reply_text("Добавьте хотя бы одно фото!")
+            return S_PHOTO
         db_update_template(context.user_data["story_tid"], photo_ids=json.dumps(photos, ensure_ascii=False))
-        await update.message.reply_text(f"✅ Фото: {len(photos)}\n\nВведите варианты подписи (каждый с новой строки):", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            f"✅ Фото: {len(photos)}\n\nВведите варианты подписи (каждый с новой строки):",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return S_TEXT
+
     if update.message.photo:
-        context.user_data["story_photos"].append(update.message.photo[-1].file_id)
-        await update.message.reply_text(f"📷 Фото {len(context.user_data['story_photos'])} добавлено. Ещё или «готово».")
+        tid   = context.user_data.get("story_tid", "tmp")
+        idx   = len(context.user_data.get("story_photos", []))
+        path  = f"media/photos/{tid}_{idx}.jpg"
+
+        # Скачиваем через Bot API прямо в файл
+        photo_obj = update.message.photo[-1]
+        tg_file   = await photo_obj.get_file()
+        await tg_file.download_to_drive(path)
+
+        context.user_data.setdefault("story_photos", []).append(path)
+        cnt = len(context.user_data["story_photos"])
+        await update.message.reply_text(f"📷 Фото {cnt} добавлено. Ещё или «готово».")
         return S_PHOTO
-    await update.message.reply_text("Отправьте фото."); return S_PHOTO
+
+    await update.message.reply_text("Отправьте фото.")
+    return S_PHOTO
 
 async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texts = [t.strip() for t in update.message.text.strip().splitlines() if t.strip()]
