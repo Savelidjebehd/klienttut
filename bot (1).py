@@ -1,6 +1,13 @@
 """
-Telegram-бот: поиск клиентов + автопостинг сторис с мультиаккаунтами.
+Telegram-бот: поиск клиентов + автопостинг сторис.
 Стек: python-telegram-bot + Telethon + Pyrogram + SQLAlchemy + SQLite
+
+КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ:
+- Бот НЕ ищет группы сам — пользователь вводит ссылки вручную
+- Парсинг: все пользователи за 2 года, без фильтра, боты удаляются сразу
+- Фильтрация только при запуске потока
+- Мульти-аккаунты в одном потоке с весовым распределением
+- Полная аналитика аккаунтов и потоков
 """
 
 import asyncio
@@ -19,14 +26,19 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
-from telethon import TelegramClient, functions
-from telethon.tl.types import (
-    InputMediaUploadedPhoto,
-    InputMediaAreaUrl,
-    MediaAreaCoordinates,
-    InputPrivacyValueAllowAll,
-)
+import urllib.parse
+
+from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl import functions as tl_functions
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.types import (
+    User,
+    InputMediaUploadedPhoto,
+    InputPrivacyValueAllowAll,
+    MediaAreaUrl,
+    MediaAreaCoordinates,
+)
 
 from pyrogram import Client as PyrogramClient
 from pyrogram import enums as pyrogram_enums
@@ -51,19 +63,17 @@ API_HASH       = "744e04f35f8aae6803294a5f3989c35b"
 SESSION_STRING = "1ApWapzMBu8GfTi-Z98bxTWatfDWW-pdK8Y3hdqE10ze5ljZlnhMlbaR-FnQ59CfZiJvVB9W-tTJueR64dOddGajpri6gIy7JUau5XrjOm38tfYs3oz3GJhhKAsn_yHFw-eYDc_TJigD78qEA8VYTS1GiFurA8lNOV_UxlE6jOcjwjdObGMSC8KVOC_uaLNzpP6ghT9ons-S3t5GsGUbRNWkAGJBilAwKo8eXwvb5TAfST9FaCDlZn98SDgsdyqcmqbrXZdlDF2hRLrs8qGaho8NDiuC2-oFDCKyHKtS78XOEVUVd8OZ0wn-At7msPzLOjEXdxQfiFJ1qp1V_xdCYLDyas213SO4="
 
 DATABASE_URL          = "sqlite:///bot_data.db"
-MAX_GROUPS            = 100
 MAX_CLIENTS           = 150
 LOW_CLIENTS           = 50
 CRITICAL_CLIENTS      = 20
 GROUP_CLIENT_LIMIT    = 150
 CLIENT_TTL_DAYS       = 30
-MESSAGE_LOOKBACK_DAYS = 730
+MESSAGE_LOOKBACK_DAYS = 730   # 2 года
 BG_CHECK_INTERVAL     = 120
-BG_SLEEP_AFTER_GROUPS = 3600
-BG_KEYWORDS_PER_PASS  = 5
 
-BUTTON_POSITIONS = {"top": 15.0, "center": 50.0, "bottom": 80.0}
-BOT_KEYWORDS     = ["bot", "support", "notify", "news", "official", "info", "help", "admin"]
+# Координаты кнопки для Telethon SendStoryRequest (0.0–1.0)
+BUTTON_POSITIONS = {"top": 0.20, "center": 0.50, "bottom": 0.85}
+BOT_KEYWORDS     = ["bot", "support", "notify", "news", "official", "info", "help", "admin", "channel"]
 
 # ===========================================================================
 # DATABASE
@@ -79,11 +89,12 @@ class Base(DeclarativeBase):
 
 class Sphere(Base):
     __tablename__ = "spheres"
-    id             = Column(Integer, primary_key=True, autoincrement=True)
-    name           = Column(String,  nullable=False)
-    group_keywords = Column(Text,    nullable=False)
-    user_keywords  = Column(Text,    nullable=False, default="[]")
-    group_links    = Column(Text,    nullable=False, default="[]")
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    name          = Column(String,  nullable=False)
+    group_links   = Column(Text,    nullable=False, default="[]")   # ссылки на группы — вводит пользователь
+    user_keywords = Column(Text,    nullable=False, default="[]")   # ключевые слова для фильтрации
+    # Устаревшие поля — оставляем для совместимости с существующей БД
+    group_keywords = Column(Text,   nullable=True,  default="[]")
     stages      = relationship("Stage",           back_populates="sphere", cascade="all, delete-orphan")
     groups      = relationship("Group",           back_populates="sphere", cascade="all, delete-orphan")
     clients     = relationship("Client",          back_populates="sphere", cascade="all, delete-orphan")
@@ -133,6 +144,7 @@ class GroupRoundRobin(Base):
 
 
 class UsersDB(Base):
+    """Широкая база ВСЕХ пользователей без фильтрации."""
     __tablename__ = "users_db"
     id         = Column(Integer, primary_key=True, autoincrement=True)
     sphere_id  = Column(Integer, ForeignKey("spheres.id"), nullable=False)
@@ -146,16 +158,21 @@ class UsersDB(Base):
 
 
 class TgAccount(Base):
+    """Telegram аккаунты. Два session string: Telethon (сторис) и Pyrogram (парсинг)."""
     __tablename__ = "tg_accounts"
-    id             = Column(Integer, primary_key=True, autoincrement=True)
-    phone          = Column(String,  nullable=False, unique=True)
-    username       = Column(String,  nullable=True)
-    session_string = Column(Text,    nullable=False)
-    is_active      = Column(Boolean, default=True)
-    stories_today  = Column(Integer, default=0)
-    stories_total  = Column(Integer, default=0)
-    tags_total     = Column(Integer, default=0)
-    last_story_at  = Column(DateTime, nullable=True)
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    phone            = Column(String,  nullable=False, unique=True)
+    username         = Column(String,  nullable=True)
+    session_string   = Column(Text,    nullable=True)   # legacy / Pyrogram
+    telethon_session = Column(Text,    nullable=True)   # Telethon — для сторис
+    pyrogram_session = Column(Text,    nullable=True)   # Pyrogram — для парсинга
+    is_active        = Column(Boolean, default=True)
+    is_premium       = Column(Boolean, default=False)
+    stories_today    = Column(Integer, default=0)
+    stories_total    = Column(Integer, default=0)
+    tags_total       = Column(Integer, default=0)
+    avg_interval     = Column(Integer, default=0)
+    last_story_at    = Column(DateTime, nullable=True)
     created_at     = Column(DateTime, default=datetime.utcnow)
     flow_accounts  = relationship("FlowAccount", back_populates="account", cascade="all, delete-orphan")
 
@@ -167,9 +184,10 @@ class StoryTemplate(Base):
     name        = Column(String,  nullable=False)
     photo_ids   = Column(Text,    nullable=False, default="[]")
     texts       = Column(Text,    nullable=False, default="[]")
-    button_text = Column(String,  nullable=True)
-    button_url  = Column(String,  nullable=True)
-    button_pos  = Column(String,  nullable=False, default="bottom")
+    button_text         = Column(String, nullable=True)
+    button_url          = Column(String, nullable=True)
+    button_message_text = Column(String, nullable=True)  # текст подставляемый в ЛС
+    button_pos          = Column(String, nullable=False, default="bottom")
     created_at  = Column(DateTime, default=datetime.utcnow)
     flows = relationship("StoryFlow", back_populates="template", cascade="all, delete-orphan")
 
@@ -208,6 +226,7 @@ class StoryFlow(Base):
 
 
 class FlowAccount(Base):
+    """Связь поток ↔ аккаунт с % нагрузки."""
     __tablename__ = "flow_accounts"
     id         = Column(Integer, primary_key=True, autoincrement=True)
     flow_id    = Column(Integer, ForeignKey("story_flows.id"),  nullable=False)
@@ -221,20 +240,20 @@ class FlowAccount(Base):
 def init_db() -> None:
     os.makedirs("media/photos", exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    # Безопасная миграция существующих БД
     with engine.connect() as conn:
         for sql in [
             "ALTER TABLE spheres ADD COLUMN user_keywords TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE spheres ADD COLUMN group_links TEXT NOT NULL DEFAULT '[]'",
-            "ALTER TABLE tg_accounts ADD COLUMN telethon_session TEXT",
-            "ALTER TABLE tg_accounts ADD COLUMN pyrogram_session TEXT",
+            "ALTER TABLE spheres ADD COLUMN group_keywords TEXT",
             "ALTER TABLE tg_accounts ADD COLUMN avg_interval INTEGER DEFAULT 0",
             "ALTER TABLE tg_accounts ADD COLUMN is_premium INTEGER DEFAULT 0",
+            "ALTER TABLE tg_accounts ADD COLUMN telethon_session TEXT",
+            "ALTER TABLE tg_accounts ADD COLUMN pyrogram_session TEXT",
             "ALTER TABLE story_templates ADD COLUMN button_message_text TEXT",
         ]:
-            try:
-                conn.execute(text(sql)); conn.commit()
-            except OperationalError:
-                pass
+            try: conn.execute(text(sql)); conn.commit()
+            except OperationalError: pass
     _seed_modes()
 
 
@@ -243,14 +262,14 @@ def _seed_modes() -> None:
         if s.query(StoryMode).count() == 0:
             s.add_all([
                 StoryMode(name="🟢 Безопасный",  filter_percent=100, mentions_min=3,  mentions_max=6,
-                          interval_min=20, interval_max=30, stories_per_batch=5,
-                          rest_minutes_min=120, rest_minutes_max=180, daily_limit=30),
+                          interval_min=5, interval_max=10, stories_per_batch=5,
+                          rest_minutes_min=30, rest_minutes_max=60, daily_limit=30),
                 StoryMode(name="🟡 Умеренный",   filter_percent=60,  mentions_min=6,  mentions_max=12,
-                          interval_min=10, interval_max=15, stories_per_batch=10,
-                          rest_minutes_min=60,  rest_minutes_max=120, daily_limit=60),
+                          interval_min=3, interval_max=7,  stories_per_batch=10,
+                          rest_minutes_min=15, rest_minutes_max=30, daily_limit=60),
                 StoryMode(name="🔴 Быстрый",     filter_percent=0,   mentions_min=12, mentions_max=20,
-                          interval_min=2,  interval_max=5,  stories_per_batch=20,
-                          rest_minutes_min=30,  rest_minutes_max=60,  daily_limit=100),
+                          interval_min=1, interval_max=3,  stories_per_batch=20,
+                          rest_minutes_min=5,  rest_minutes_max=15, daily_limit=100),
             ])
             s.commit()
 
@@ -265,18 +284,21 @@ def db_get_spheres():
 def db_get_sphere(sid: int) -> Optional[Sphere]:
     with SessionLocal() as s:
         r = s.query(Sphere).filter(Sphere.id == sid).first()
-        if r: s.expunge(r)
-        return r
+        if r: s.expunge(r); return r
 
 def db_get_sphere_by_name(name: str) -> Optional[Sphere]:
     with SessionLocal() as s:
         r = s.query(Sphere).filter(Sphere.name == name).first()
-        if r: s.expunge(r)
-        return r
+        if r: s.expunge(r); return r
 
-def db_add_sphere(name, group_keywords, user_keywords) -> int:
+def db_add_sphere(name: str, group_links: list, user_keywords: list) -> int:
     with SessionLocal() as s:
-        obj = Sphere(name=name, group_keywords=group_keywords, user_keywords=user_keywords)
+        obj = Sphere(
+            name=name,
+            group_links=json.dumps(group_links, ensure_ascii=False),
+            user_keywords=json.dumps(user_keywords, ensure_ascii=False),
+            group_keywords="[]",
+        )
         s.add(obj); s.commit(); return obj.id
 
 def db_delete_sphere(sid: int) -> None:
@@ -284,15 +306,13 @@ def db_delete_sphere(sid: int) -> None:
         r = s.query(Sphere).filter(Sphere.id == sid).first()
         if r: s.delete(r); s.commit()
 
-def db_update_sphere_keywords(sid: int, gkw: str, ukw: str) -> None:
+def db_update_sphere(sid: int, group_links: list = None, user_keywords: list = None) -> None:
     with SessionLocal() as s:
         r = s.query(Sphere).filter(Sphere.id == sid).first()
-        if r: r.group_keywords = gkw; r.user_keywords = ukw; s.commit()
-
-def db_update_sphere_group_links(sid: int, links: list) -> None:
-    with SessionLocal() as s:
-        r = s.query(Sphere).filter(Sphere.id == sid).first()
-        if r: r.group_links = json.dumps(links, ensure_ascii=False); s.commit()
+        if r:
+            if group_links   is not None: r.group_links   = json.dumps(group_links,   ensure_ascii=False)
+            if user_keywords is not None: r.user_keywords = json.dumps(user_keywords, ensure_ascii=False)
+            s.commit()
 
 def db_add_stage(sid, desc, script) -> None:
     with SessionLocal() as s:
@@ -318,9 +338,12 @@ def db_get_user_keywords(sid: int) -> list:
         r = s.query(Sphere.user_keywords).filter(Sphere.id == sid).first()
         return json.loads(r[0] or "[]") if r else []
 
-def db_count_groups(sid: int) -> int:
+def db_get_group_links(sid: int) -> list:
     with SessionLocal() as s:
-        return s.query(Group).filter(Group.sphere_id == sid).count()
+        r = s.query(Sphere.group_links).filter(Sphere.id == sid).first()
+        return json.loads(r[0] or "[]") if r else []
+
+# --- Groups & Clients ---
 
 def db_save_groups(sid, sname, links) -> int:
     saved = 0
@@ -368,14 +391,12 @@ def db_get_random_client(sid: int) -> Optional[Client]:
         if not grps: return None
         gu  = random.choice(grps)[0]
         row = s.query(Client).filter(Client.sphere_id == sid, Client.used == False, Client.group_username == gu).order_by(Client.id).first()
-        if row: s.expunge(row)
-        return row
+        if row: s.expunge(row); return row
 
 def db_mark_client_used(cid: int) -> Optional[str]:
     with SessionLocal() as s:
         c = s.query(Client).filter(Client.id == cid).first()
         if c: c.used = True; g = c.group_username; s.commit(); return g
-        return None
 
 def db_is_username_known(sid: int, username: str) -> bool:
     with SessionLocal() as s:
@@ -430,7 +451,7 @@ def db_count_users(sid: int) -> int:
     with SessionLocal() as s:
         return s.query(UsersDB).filter(UsersDB.sphere_id == sid).count()
 
-# --- accounts ---
+# --- Accounts ---
 
 def db_get_accounts() -> list:
     with SessionLocal() as s:
@@ -439,30 +460,48 @@ def db_get_accounts() -> list:
 def db_get_account(aid: int) -> Optional[TgAccount]:
     with SessionLocal() as s:
         r = s.query(TgAccount).filter(TgAccount.id == aid).first()
-        if r: s.expunge(r)
-        return r
+        if r: s.expunge(r); return r
 
-def db_add_account(phone: str, username: str, session_string: str) -> int:
+def db_add_account(
+    phone: str,
+    username: str,
+    telethon_session: str,
+    pyrogram_session: str,
+    is_premium: bool = False,
+) -> int:
     with SessionLocal() as s:
-        # Проверяем нет ли уже такого
-        existing = s.query(TgAccount).filter(TgAccount.phone == phone).first()
-        if existing:
-            existing.session_string = session_string
-            existing.username = username
-            s.commit()
-            return existing.id
-        obj = TgAccount(phone=phone, username=username, session_string=session_string)
+        ex = s.query(TgAccount).filter(TgAccount.phone == phone).first()
+        if ex:
+            ex.username         = username
+            ex.telethon_session = telethon_session
+            ex.pyrogram_session = pyrogram_session
+            ex.is_premium       = is_premium
+            s.commit(); return ex.id
+        obj = TgAccount(
+            phone=phone, username=username,
+            telethon_session=telethon_session,
+            pyrogram_session=pyrogram_session,
+            session_string=pyrogram_session,  # legacy совместимость
+            is_premium=is_premium,
+        )
         s.add(obj); s.commit(); return obj.id
 
-def db_update_account_stats(aid: int, stories_delta: int = 0, tags_delta: int = 0) -> None:
+def db_update_account_stats(aid: int, stories_delta: int = 0, tags_delta: int = 0, interval_min: int = 0) -> None:
     with SessionLocal() as s:
         r = s.query(TgAccount).filter(TgAccount.id == aid).first()
         if r:
             r.stories_today = (r.stories_today or 0) + stories_delta
             r.stories_total = (r.stories_total or 0) + stories_delta
             r.tags_total    = (r.tags_total    or 0) + tags_delta
+            if interval_min: r.avg_interval = interval_min
             r.last_story_at = datetime.utcnow()
             s.commit()
+
+def db_get_account_load_pct(aid: int) -> int:
+    with SessionLocal() as s:
+        fas = (s.query(FlowAccount).join(StoryFlow)
+               .filter(FlowAccount.account_id == aid, StoryFlow.status == "running").all())
+        return min(100, sum(fa.load_pct for fa in fas))
 
 def db_get_account_flow_count(aid: int) -> tuple:
     with SessionLocal() as s:
@@ -471,13 +510,17 @@ def db_get_account_flow_count(aid: int) -> tuple:
                   .filter(FlowAccount.account_id == aid, StoryFlow.status == "running").count())
         return total, active
 
-def db_get_account_load_pct(aid: int) -> int:
+def db_get_account_flows(aid: int) -> list:
+    """Все потоки аккаунта с деталями."""
     with SessionLocal() as s:
-        fas = (s.query(FlowAccount).join(StoryFlow)
-               .filter(FlowAccount.account_id == aid, StoryFlow.status == "running").all())
-        return min(100, sum(fa.load_pct for fa in fas))
+        fas = s.query(FlowAccount).filter(FlowAccount.account_id == aid).all()
+        result = []
+        for fa in fas:
+            flow = s.query(StoryFlow).filter(StoryFlow.id == fa.flow_id).first()
+            if flow: result.append({"flow_id": flow.id, "status": flow.status, "load_pct": fa.load_pct, "stories_sent": flow.stories_sent})
+        return result
 
-# --- templates ---
+# --- Templates ---
 
 def db_create_template(sid: int, name: str) -> int:
     with SessionLocal() as s:
@@ -492,8 +535,7 @@ def db_get_templates(sid: int) -> list:
 def db_get_template(tid: int) -> Optional[StoryTemplate]:
     with SessionLocal() as s:
         r = s.query(StoryTemplate).filter(StoryTemplate.id == tid).first()
-        if r: s.expunge(r)
-        return r
+        if r: s.expunge(r); return r
 
 def db_update_template(tid: int, **kwargs) -> None:
     with SessionLocal() as s:
@@ -502,7 +544,7 @@ def db_update_template(tid: int, **kwargs) -> None:
             for k, v in kwargs.items(): setattr(r, k, v)
             s.commit()
 
-# --- modes & flows ---
+# --- Modes & Flows ---
 
 def db_get_modes() -> list:
     with SessionLocal() as s:
@@ -511,8 +553,7 @@ def db_get_modes() -> list:
 def db_get_mode(mid: int) -> Optional[StoryMode]:
     with SessionLocal() as s:
         r = s.query(StoryMode).filter(StoryMode.id == mid).first()
-        if r: s.expunge(r)
-        return r
+        if r: s.expunge(r); return r
 
 def db_create_flow(sid, tid, mid, end_time) -> int:
     with SessionLocal() as s:
@@ -538,8 +579,7 @@ def db_get_flows(sid: int) -> list:
 def db_get_flow(fid: int) -> Optional[StoryFlow]:
     with SessionLocal() as s:
         r = s.query(StoryFlow).filter(StoryFlow.id == fid).first()
-        if r: s.expunge(r)
-        return r
+        if r: s.expunge(r); return r
 
 def db_stop_flow(fid: int) -> None:
     with SessionLocal() as s:
@@ -557,225 +597,403 @@ def db_update_flow_stats(fid: int, sent: int, tagged: int, log_entry: str) -> No
             s.commit()
 
 # ===========================================================================
-# TELETHON
+# TELETHON (парсинг)
 # ===========================================================================
 
-telethon_client: Optional[TelegramClient] = None
+# Кеш Pyrogram клиентов для парсинга (session_string -> client)
+_parser_clients: dict = {}
 
-async def ensure_telethon() -> TelegramClient:
-    global telethon_client
-    if telethon_client is None or not telethon_client.is_connected():
-        telethon_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-        await telethon_client.connect()
-    return telethon_client
+async def ensure_pyro_parser() -> Optional[PyrogramClient]:
+    """Возвращает первый доступный активный Pyrogram клиент для парсинга."""
+    accounts = db_get_accounts()
+    if not accounts:
+        return None
+    for acc in accounts:
+        if not acc.is_active:
+            continue
+        # Используем pyrogram_session, fallback на session_string (legacy)
+        session = getattr(acc, "pyrogram_session", None) or acc.session_string
+        if not session:
+            continue
+        client = await get_pyro_parser(session)
+        if client:
+            return client
+    return None
+
+
+async def get_pyro_parser(session_string: str) -> Optional[PyrogramClient]:
+    """Создаёт или возвращает кешированный Pyrogram клиент из session string."""
+    key = session_string[:30]
+    if key in _parser_clients:
+        client = _parser_clients[key]
+        if client.is_connected:
+            return client
+    try:
+        client = PyrogramClient(
+            name=f"parser_{abs(hash(key)) % 999999}",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session_string,
+            in_memory=True,
+        )
+        await client.start()
+        _parser_clients[key] = client
+        return client
+    except Exception as exc:
+        logger.error("[PARSER] Failed: %s", exc)
+        return None
 
 # ===========================================================================
-# PYROGRAM
+# PYROGRAM (публикация историй)
 # ===========================================================================
 
 _pyrogram_clients: dict = {}
 
 async def get_pyrogram_client(account: TgAccount) -> Optional[PyrogramClient]:
-    aid = account.id
+    """
+    Pyrogram клиент для парсинга групп.
+    Использует pyrogram_session аккаунта.
+    """
+    aid     = account.id
+    session = getattr(account, "pyrogram_session", None) or account.session_string
+    if not session:
+        logger.warning("[PYRO] %s: нет pyrogram_session", account.phone)
+        return None
     if aid not in _pyrogram_clients:
         try:
             client = PyrogramClient(
-                f"pyro_{account.phone}",
-                api_id=API_ID,
-                api_hash=API_HASH,
-                session_string=account.session_string,
+                name=f"pyro_{aid}",
+                api_id=API_ID, api_hash=API_HASH,
+                session_string=session,
+                in_memory=True,
             )
             await client.start()
             _pyrogram_clients[aid] = client
         except Exception as exc:
             logger.error("[PYRO] %s: %s", account.phone, exc)
             return None
-    client = _pyrogram_clients[aid]
+    client = _pyrogram_clients.get(aid)
+    if not client:
+        return None
     if not client.is_connected:
         try: await client.start()
         except Exception: return None
     return client
 
 # ===========================================================================
-# ПРОГРЕСС-БАР
-# ===========================================================================
-
-def make_progress_bar(current: int, total: int, width: int = 16) -> str:
-    pct    = min(100, int(current / total * 100)) if total else 0
-    filled = int(width * pct / 100)
-    return f"{'Ӏ' * filled}{' ' * (width - filled)} {pct}%"
-
-# ===========================================================================
-# ФОНОВЫЙ ПАРСИНГ
+# ПАРСИНГ ПОЛЬЗОВАТЕЛЕЙ
 # ===========================================================================
 
 _collecting: set = set()
-_last_group_search: dict = {}
 
 
-def _is_public_group(chat) -> bool:
-    if isinstance(chat, Chat):    return bool(getattr(chat, "username", None))
-    if isinstance(chat, Channel): return bool(getattr(chat, "megagroup", False)) and bool(getattr(chat, "username", None))
-    return False
+def _remove_client_from_users_db(sphere_id: int, client_id: int) -> None:
+    """
+    Удаляет пользователя из users_db когда его показали в ручном поиске.
+    Это не даст ему попасть в отметки сторис.
+    """
+    with SessionLocal() as s:
+        # Находим username клиента
+        c = s.query(Client).filter(Client.id == client_id).first()
+        if not c or not c.username: return
+        # Удаляем из users_db по username
+        s.query(UsersDB).filter(
+            UsersDB.sphere_id == sphere_id,
+            UsersDB.username == c.username,
+        ).delete()
+        s.commit()
+
 
 def _is_bot(user) -> bool:
     if getattr(user, "bot", False): return True
     un = (user.username or "").lower()
     return un.endswith("bot") or any(k in un for k in BOT_KEYWORDS)
 
-async def _search_one_keyword(kw: str) -> list:
-    client = await ensure_telethon()
-    found  = []
+async def _get_user_bio_pyro(client: PyrogramClient, uid: int) -> str:
+    """Получает bio пользователя через Pyrogram."""
     try:
-        result = await client(SearchRequest(q=kw, limit=100))
-        for chat in result.chats:
-            if not _is_public_group(chat): continue
-            u = getattr(chat, "username", None)
-            if u: found.append(f"https://t.me/{u.lower()}")
-    except Exception as exc:
-        logger.warning("SearchRequest «%s»: %s", kw, exc)
-    await asyncio.sleep(0)
-    return found
-
-async def _find_groups_bg(sid: int, sname: str, keywords: list, progress_message=None) -> int:
-    if db_count_groups(sid) >= MAX_GROUPS:
-        return db_count_groups(sid)
-    batch    = keywords[:BG_KEYWORDS_PER_PASS]
-    total_kw = len(batch)
-    all_links: list = []
-    last_edit = 0.0
-    for i, kw in enumerate(batch):
-        if db_count_groups(sid) + len(all_links) >= MAX_GROUPS: break
-        links     = await _search_one_keyword(kw)
-        new_links = [l for l in links if l not in all_links]
-        all_links.extend(new_links)
-        now = asyncio.get_event_loop().time()
-        if progress_message and (now - last_edit) >= 3.0:
-            bar = make_progress_bar(i + 1, total_kw)
-            try:
-                await progress_message.edit_text(
-                    f"🔍 Поиск групп...\n\n{bar}\n\nОбработано: {i+1}/{total_kw}\nНайдено: {len(all_links)}\n\n✅ Бот работает!"
-                )
-                last_edit = now
-            except Exception: pass
-        await asyncio.sleep(1.5)
-    saved = db_save_groups(sid, sname, list(dict.fromkeys(all_links)))
-    total = db_count_groups(sid)
-    if progress_message:
-        try: await progress_message.edit_text(f"✅ Поиск завершён!\n\n{make_progress_bar(1,1)}\n\nГрупп: {total}")
-        except Exception: pass
-    return total
-
-async def _get_user_bio(client, uid) -> str:
-    try:
-        full = await client(GetFullUserRequest(uid))
-        return full.full_user.about or ""
+        user = await client.get_users(uid)
+        return user.bio or "" if user else ""
     except Exception:
         return ""
 
-async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int = 300) -> int:
-    client   = await ensure_telethon()
-    lookback = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
+async def _collect_one_group(gu: str, sid: int, user_keywords: list, limit: int = 5000) -> int:
+    """
+    Парсинг через Pyrogram get_chat_history.
+    Требует хотя бы один добавленный аккаунт.
+    """
+    client = await ensure_pyro_parser()
+    if not client:
+        logger.warning("[PARSE] Нет аккаунтов для парсинга. Добавьте аккаунт через 👤 Аккаунты.")
+        return 0
+    return await _parse_group_with_pyro(client, gu, sid, user_keywords, limit=limit)
+
+
+async def _parse_group_with_pyro(
+    client: PyrogramClient,
+    gu: str,
+    sid: int,
+    user_keywords: list,
+    limit: int = 5000,
+    offset_id: int = 0,
+) -> int:
+    """
+    Парсит группу через Pyrogram.
+    Собирает всех кто писал, боты удаляются сразу.
+    """
+    lookback  = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
     seen_ids: set   = set()
     collected: list = []
+    count           = 0
+    last_msg_id     = 0
+
     try:
-        entity = await client.get_entity(gu)
-        await asyncio.sleep(0)
-        offset_id, total_fetched = 0, 0
-        while total_fetched < limit:
-            batch = min(100, limit - total_fetched)
-            history = await client(GetHistoryRequest(
-                peer=entity, limit=batch, offset_date=None,
-                offset_id=offset_id, max_id=0, min_id=0, add_offset=0, hash=0,
-            ))
-            await asyncio.sleep(0)
-            if not history.messages: break
-            stop = False
-            for msg in history.messages:
-                if not msg.date: continue
-                if msg.date.replace(tzinfo=None) < lookback: stop = True; break
-                if not getattr(msg, "from_id", None): continue
-                uid = getattr(msg.from_id, "user_id", None)
-                if not uid or uid in seen_ids: continue
-                seen_ids.add(uid)
-                try:
-                    user = await client.get_entity(uid)
-                    await asyncio.sleep(0)
-                    if not isinstance(user, User): continue
-                    if _is_bot(user): continue
-                    bio = await _get_user_bio(client, uid)
-                    # Этап 1: все → users_db без фильтра
-                    db_save_user(sid, str(uid), user.username or "",
-                                 user.first_name or "", user.last_name or "", bio)
-                    # Для clients — с фильтром
-                    if user.username:
-                        un = user.username.lower()
-                        if not db_is_username_known(sid, un):
-                            h = " ".join(filter(None, [user.username, user.first_name, user.last_name, bio])).lower()
-                            if not user_keywords or any(k.lower() in h for k in user_keywords):
-                                collected.append(un)
-                except Exception:
-                    pass
-            total_fetched += len(history.messages)
-            offset_id      = history.messages[-1].id
-            if stop or len(history.messages) < batch: break
-            await asyncio.sleep(0.5)
+        # Нормализуем username
+        chat = gu if gu.startswith("@") else f"@{gu}"
+
+        async for msg in client.get_chat_history(chat, limit=limit, offset_id=offset_id):
+            count += 1
+            if count % 100 == 0:
+                await asyncio.sleep(0)  # yield event loop
+
+            if not msg.date: continue
+            if msg.date.replace(tzinfo=None) < lookback: break
+
+            last_msg_id = msg.id
+            sender = msg.from_user
+            if not sender: continue
+
+            uid = sender.id
+            if uid in seen_ids: continue
+            seen_ids.add(uid)
+
+            # Убираем ботов сразу
+            if getattr(sender, "is_bot", False): continue
+            un_check = (sender.username or "").lower()
+            if un_check.endswith("bot") or any(k in un_check for k in BOT_KEYWORDS):
+                continue
+
+            username   = sender.username   or ""
+            first_name = sender.first_name or ""
+            last_name  = sender.last_name  or ""
+
+            bio = ""
+            if user_keywords:
+                bio = await _get_user_bio_pyro(client, uid)
+
+            # Сохраняем всех в users_db без фильтра
+            db_save_user(sid, str(uid), username, first_name, last_name, bio)
+
+            # Для clients — с фильтром
+            if username:
+                un = username.lower()
+                if not db_is_username_known(sid, un):
+                    h = " ".join(filter(None, [username, first_name, last_name, bio])).lower()
+                    if not user_keywords or any(k.lower() in h for k in user_keywords):
+                        collected.append(un)
+
     except Exception as exc:
-        logger.warning("Error collecting «%s»: %s", gu, exc)
+        logger.warning("[PYRO PARSE] «%s»: %s", gu, exc)
+
     saved = db_save_clients(sid, gu, collected)
     db_mark_group_parsed(f"https://t.me/{gu}")
+    logger.info("[PYRO] %d unique, %d saved from «%s»", len(seen_ids), saved, gu)
     return saved
 
+async def _collect_group_multi_account(
+    group_username: str,
+    sid: int,
+    user_keywords: list,
+    limit_per_account: int = 5000,
+) -> int:
+    """
+    Парсинг одной группы несколькими аккаунтами последовательно.
+    Каждый аккаунт парсит свою порцию сообщений и передаёт эстафету следующему.
+    Это позволяет обойти лимиты и собрать максимум участников.
+    """
+    accounts = db_get_accounts()
+    if not accounts:
+        # Нет аккаунтов — парсим основным SESSION_STRING
+        return await _collect_one_group(group_username, sid, user_keywords, limit=limit_per_account)
+
+    total_saved = 0
+    offset_id   = 0   # передаём между аккаунтами для продолжения с того же места
+
+    for acc in accounts:
+        if not acc.is_active: continue
+        pyro_sess = getattr(acc, "pyrogram_session", None) or acc.session_string
+        saved, last_offset = await _collect_group_with_account(
+            group_username=group_username,
+            sid=sid,
+            user_keywords=user_keywords,
+            session_string=pyro_sess,
+            limit=limit_per_account,
+            start_offset_id=offset_id,
+        )
+        total_saved += saved
+        if last_offset > 0:
+            offset_id = last_offset   # следующий аккаунт продолжает отсюда
+        logger.info("[MULTI] @%s parsed «%s»: +%d clients (offset=%d)",
+                    acc.username or acc.phone, group_username, saved, offset_id)
+        await asyncio.sleep(2)   # пауза между аккаунтами
+
+    # Если аккаунтов нет или все неактивны — логируем
+    if not any(a.is_active for a in accounts):
+        logger.warning("[MULTI] Нет активных аккаунтов для парсинга «%s»", group_username)
+
+    db_mark_group_parsed(f"https://t.me/{group_username}")
+    return total_saved
+
+
+async def _collect_group_with_account(
+    group_username: str,
+    sid: int,
+    user_keywords: list,
+    session_string: str,
+    limit: int,
+    start_offset_id: int = 0,
+) -> tuple:
+    """
+    Парсит группу конкретным Pyrogram аккаунтом начиная с offset_id.
+    Возвращает (кол-во сохранённых, последний msg_id).
+    """
+    lookback  = datetime.utcnow() - timedelta(days=MESSAGE_LOOKBACK_DAYS)
+    seen_ids: set   = set()
+    collected: list = []
+    last_offset     = start_offset_id
+    count           = 0
+
+    try:
+        client = await get_pyro_parser(session_string)
+        if not client:
+            return 0, start_offset_id
+
+        chat = group_username if group_username.startswith("@") else f"@{group_username}"
+
+        async for msg in client.get_chat_history(chat, limit=limit, offset_id=start_offset_id):
+            count += 1
+            if count % 100 == 0:
+                await asyncio.sleep(0)
+
+            if not msg.date: continue
+            if msg.date.replace(tzinfo=None) < lookback: break
+
+            last_offset = msg.id
+
+            sender = msg.from_user
+            if not sender: continue
+
+            uid = sender.id
+            if uid in seen_ids: continue
+            seen_ids.add(uid)
+
+            if getattr(sender, "is_bot", False): continue
+            un_check = (sender.username or "").lower()
+            if un_check.endswith("bot") or any(k in un_check for k in BOT_KEYWORDS):
+                continue
+
+            username   = sender.username   or ""
+            first_name = sender.first_name or ""
+            last_name  = sender.last_name  or ""
+
+            bio = ""
+            if user_keywords:
+                bio = await _get_user_bio_pyro(client, uid)
+
+            db_save_user(sid, str(uid), username, first_name, last_name, bio)
+
+            if username:
+                un = username.lower()
+                if not db_is_username_known(sid, un):
+                    h = " ".join(filter(None, [username, first_name, last_name, bio])).lower()
+                    if not user_keywords or any(k.lower() in h for k in user_keywords):
+                        collected.append(un)
+
+        await client.stop()
+
+    except Exception as exc:
+        logger.warning("[MULTI PYRO] «%s»: %s", group_username, exc)
+
+    saved = db_save_clients(sid, group_username, collected)
+    return saved, last_offset
+
+
 async def _fill_buffer_bg(sid: int, progress_message=None) -> None:
+    """
+    Фоновый сбор клиентов через несколько аккаунтов.
+    Каждый аккаунт парсит группу с того места где закончил предыдущий.
+    """
     if sid in _collecting: return
     _collecting.add(sid)
     try:
         sphere = db_get_sphere(sid)
         if not sphere: return
-        gkws = json.loads(sphere.group_keywords or "[]")
         ukws = db_get_user_keywords(sid)
-        # Парсим группы добавленные пользователем
-        gl = json.loads(getattr(sphere, "group_links", None) or "[]")
-        if gl:
-            links = []
-            for l in gl:
-                l = l.strip()
-                if not l.startswith("https://"): l = f"https://t.me/{l.lstrip('@')}"
-                links.append(l)
+
+        # Загружаем группы из ссылок
+        raw_links = db_get_group_links(sid)
+        links = []
+        for l in raw_links:
+            l = l.strip()
+            if not l.startswith("https://"): l = f"https://t.me/{l.lstrip('@').lstrip('t.me/').lstrip('/')}"
+            links.append(l)
+        if links:
             db_save_groups(sid, sphere.name, links)
-        if db_count_groups(sid) < 10:
-            await _find_groups_bg(sid, sphere.name, gkws, progress_message)
+
         groups = db_get_all_group_usernames(sid)
-        if not groups: return
+        if not groups:
+            if progress_message:
+                try: await progress_message.edit_text("⚠️ Нет групп. Добавьте ссылки через ➕ Добавить группы.")
+                except Exception: pass
+            return
+
+        accounts = db_get_accounts()
+        acc_info = f"{len(accounts)} аккаунтов" if accounts else "основной аккаунт"
+        if not accounts:
+            if progress_message:
+                try: await progress_message.edit_text(
+                    "⚠️ Нет аккаунтов для парсинга!\n\n"
+                    "Добавьте аккаунт через:\n"
+                    "📸 Отметки сторис → 👤 Аккаунты → ➕ Добавить аккаунт"
+                )
+                except Exception: pass
+            return
+
         if progress_message:
-            try: await progress_message.edit_text(f"👥 Собираю клиентов...\n\n{make_progress_bar(0, len(groups))}\n\n✅ Бот работает!")
+            try: await progress_message.edit_text(
+                f"👥 Парсю {len(groups)} групп через {acc_info}...\n\n✅ Бот работает!"
+            )
             except Exception: pass
+
         idx, att  = db_get_round_robin_index(sid), 0
         last_edit = asyncio.get_event_loop().time()
+
         while db_count_available_clients(sid) < MAX_CLIENTS and att < len(groups):
-            await _collect_one_group(groups[idx % len(groups)], sid, ukws)
+            gu = groups[idx % len(groups)]
+            # Используем мульти-аккаунтный парсинг
+            await _collect_group_multi_account(gu, sid, ukws)
             idx = (idx + 1) % len(groups); att += 1
+
             now = asyncio.get_event_loop().time()
             if progress_message and (now - last_edit) >= 3.0:
-                bar = make_progress_bar(att, len(groups))
                 cnt = db_count_available_clients(sid)
-                try: await progress_message.edit_text(f"👥 Собираю клиентов...\n\n{bar}\n\nНайдено: {cnt}\n✅ Бот работает!"); last_edit = now
+                try:
+                    await progress_message.edit_text(
+                        f"👥 Парсю группы...\n\nОбработано: {att}/{len(groups)}\n"
+                        f"Найдено: {cnt}\n\n✅ Бот работает!"
+                    )
+                    last_edit = now
                 except Exception: pass
             await asyncio.sleep(0)
+
         db_set_round_robin_index(sid, idx)
-        if db_count_available_clients(sid) < CRITICAL_CLIENTS:
-            await _find_groups_bg(sid, sphere.name, gkws)
-            groups2 = db_get_all_group_usernames(sid)
-            idx2, att2 = db_get_round_robin_index(sid), 0
-            while db_count_available_clients(sid) < MAX_CLIENTS and att2 < len(groups2):
-                await _collect_one_group(groups2[idx2 % len(groups2)], sid, ukws)
-                idx2 = (idx2 + 1) % len(groups2); att2 += 1
-                await asyncio.sleep(0)
-            db_set_round_robin_index(sid, idx2)
         total = db_count_available_clients(sid)
         if progress_message:
-            try: await progress_message.edit_text(f"✅ Готово! Найдено клиентов: {total}\nНажмите «➡️ Следующий».")
+            try: await progress_message.edit_text(
+                f"✅ Готово! Найдено клиентов: {total}\nНажмите «➡️ Следующий»."
+            )
             except Exception: pass
+
     except Exception as exc:
         logger.error("[FILL] sid=%d: %s", sid, exc)
     finally:
@@ -785,37 +1003,31 @@ async def background_worker() -> None:
     logger.info("Background worker started.")
     while True:
         try:
-            now = asyncio.get_event_loop().time()
             for sphere in db_get_spheres():
                 sid = sphere.id
                 cc  = db_count_available_clients(sid)
-                gc  = db_count_groups(sid)
                 if cc < LOW_CLIENTS and sid not in _collecting:
                     asyncio.create_task(_fill_buffer_bg(sid))
-                last = _last_group_search.get(sid, 0)
-                if gc < MAX_GROUPS and (now - last) >= BG_SLEEP_AFTER_GROUPS:
-                    _last_group_search[sid] = now
-                    kws = json.loads(sphere.group_keywords or "[]")
-                    asyncio.create_task(_find_groups_bg(sid, sphere.name, kws))
                 await asyncio.sleep(1)
         except Exception as exc:
             logger.error("[BG] %s", exc)
         await asyncio.sleep(BG_CHECK_INTERVAL)
 
 # ===========================================================================
-# УМНОЕ РАСПРЕДЕЛЕНИЕ
+# УМНОЕ РАСПРЕДЕЛЕНИЕ НАГРУЗКИ
 # ===========================================================================
 
 def _smart_distribute(accounts: list) -> list:
+    """Распределяет нагрузку по весам обратно пропорционально текущей нагрузке."""
     if not accounts: return []
     if len(accounts) == 1: return [(accounts[0].id, 100)]
-    scores = [(acc, max(1, 100 - db_get_account_load_pct(acc.id))) for acc in accounts]
-    total_w = sum(w for _, w in scores)
-    result = []; remaining = 100
-    for i, (acc, w) in enumerate(scores):
-        if i == len(scores) - 1: pct = remaining
+    weights = [(acc, max(1, 100 - db_get_account_load_pct(acc.id))) for acc in accounts]
+    total_w = sum(w for _, w in weights)
+    result  = []; remaining = 100
+    for i, (acc, w) in enumerate(weights):
+        if i == len(weights) - 1: pct = remaining
         else: pct = round(w / total_w * 100); remaining -= pct
-        result.append((acc.id, pct))
+        result.append((acc.id, max(1, pct)))
     return result
 
 # ===========================================================================
@@ -826,6 +1038,7 @@ _active_flows: dict = {}
 
 
 def _pick_users(sid: int, mode: StoryMode, keywords: list, count: int) -> list:
+    """Фильтрация при запуске (Этап 2)."""
     all_u = db_get_all_users(sid)
     fil_u = db_get_filtered_users(sid, keywords)
     if not all_u: return []
@@ -835,162 +1048,245 @@ def _pick_users(sid: int, mode: StoryMode, keywords: list, count: int) -> list:
         elif mode.filter_percent == 0:   pool = all_u
         else: pool = fil_u if (fil_u and random.random() < mode.filter_percent / 100) else all_u
         if pool: selected.append(random.choice(pool))
+    # Дедупликация
     seen = set(); unique = []
     for u in selected:
         if u.user_id not in seen: seen.add(u.user_id); unique.append(u)
     return unique
 
-async def _publish_story(account: TgAccount, template: StoryTemplate, users: list) -> bool:
-    """
-    Публикует историю ТОЛЬКО через Telethon raw API.
-    Фото читается с диска — photo_ids хранит локальные пути (media/photos/...).
-    Используем InputMediaAreaUrl из telethon.tl.types — НЕ telethon.types.
-    """
-    tc = None
-    try:
-        session = getattr(account, "telethon_session", None) or account.session_string
-        if not session:
-            logger.error("[STORY] ❌ %s: нет telethon_session", account.phone)
-            return False
+def _weighted_choice(load_list: list) -> int:
+    """Выбор аккаунта по весу (вероятностно, не по очереди)."""
+    total = sum(pct for _, pct in load_list)
+    if total == 0: return load_list[0][0]
+    r = random.randint(0, total - 1); acc_sum = 0
+    for aid, pct in load_list:
+        acc_sum += pct
+        if r < acc_sum: return aid
+    return load_list[-1][0]
 
+# Кеш Telethon клиентов — один клиент на аккаунт, не переподключаемся на каждую сторис
+_telethon_clients: dict = {}
+
+async def _get_telethon_client(account: TgAccount) -> Optional[TelegramClient]:
+    """
+    Возвращает кешированный Telethon клиент для аккаунта.
+    Создаёт новый только если нет или отключился.
+    """
+    session = getattr(account, "telethon_session", None)
+    if not session:
+        logger.warning("[TELETHON] @%s: нет telethon_session", account.username or account.phone)
+        return None
+
+    aid = account.id
+    tc  = _telethon_clients.get(aid)
+
+    # Проверяем существующий клиент
+    if tc and tc.is_connected():
+        try:
+            if await tc.is_user_authorized():
+                return tc
+        except Exception:
+            pass
+
+    # Создаём новый
+    try:
         tc = TelegramClient(StringSession(session), API_ID, API_HASH)
         await tc.connect()
         if not await tc.is_user_authorized():
             await tc.disconnect()
-            logger.error("[STORY] ❌ %s: Telethon сессия не авторизована", account.phone)
+            logger.warning("[TELETHON] @%s: не авторизован", account.username or account.phone)
+            return None
+        _telethon_clients[aid] = tc
+        logger.info("[TELETHON] @%s: подключён", account.username or account.phone)
+        return tc
+    except Exception as exc:
+        logger.error("[TELETHON] @%s: %s", account.username or account.phone, exc)
+        return None
+
+
+def _build_button_url(account: TgAccount, template: StoryTemplate) -> Optional[str]:
+    """
+    Формирует URL кнопки в формате https://t.me/username?text=encoded_text
+    Использует URL encoding для текста в ЛС.
+    """
+    username = account.username
+    if not username:
+        return None
+
+    msg_text = getattr(template, "button_message_text", None) or ""
+    if not msg_text:
+        # Если текст для ЛС не задан — просто ссылка на профиль
+        return f"https://t.me/{username}"
+
+    encoded = urllib.parse.quote(msg_text, safe="")
+    url = f"https://t.me/{username}?text={encoded}"
+    logger.info("[STORY] Button URL: %s", url)
+    return url
+
+
+async def _publish_story(account: TgAccount, template: StoryTemplate, users: list) -> bool:
+    """
+    Публикует историю через Telethon raw API.
+    Использует tl.types.MediaAreaUrl + MediaAreaCoordinates (координаты 0–100).
+    Файл берётся из локального пути (не file_id).
+    """
+    tc = None
+    try:
+        tc = await _get_telethon_client(account)
+        if not tc:
+            logger.error("[STORY] @%s: нет Telethon клиента", account.username or account.phone)
             return False
 
         photo_paths = json.loads(template.photo_ids or "[]")
         texts       = json.loads(template.texts     or "[]")
+
         if not photo_paths:
-            logger.error("[STORY] ❌ %s: нет фото в шаблоне #%d", account.phone, template.id)
-            await tc.disconnect()
+            logger.error("[STORY] @%s: нет фото в шаблоне", account.username or account.phone)
             return False
 
+        # Подпись + отметки
         caption = random.choice(texts) if texts else ""
         if users:
             mentions = [f"@{u.username}" for u in users if u.username]
             mid      = len(mentions) // 2
             caption  = f"{caption}\n\n{' '.join(mentions[:mid])}\n{' '.join(mentions[mid:])}".strip()
 
-        # Выбираем случайный файл с диска
+        # Локальный файл → Telethon upload_file
         photo_path = random.choice(photo_paths)
-        logger.info("[STORY] %s: загружаю фото из %s", account.phone, photo_path)
-
         if not os.path.exists(photo_path):
-            logger.error("[STORY] ❌ %s: файл не найден: %s", account.phone, photo_path)
+            logger.error("[STORY] @%s: файл не найден: %s", account.username or account.phone, photo_path)
             await tc.disconnect()
             return False
 
-        # Загружаем файл через Telethon upload_file (путь к файлу на диске)
+        logger.info("[STORY] @%s: загружаю %s", account.username or account.phone, photo_path)
         uploaded = await tc.upload_file(photo_path)
         media    = InputMediaUploadedPhoto(file=uploaded)
 
-        # Кнопка через InputMediaAreaUrl (правильный тип из telethon.tl.types)
+        # Кнопка MediaAreaUrl (координаты 0–100)
         media_areas = []
         button_url  = _build_button_url(account, template)
         if button_url:
-            pos_y = BUTTON_POSITIONS.get(template.button_pos, 0.85)
-            media_areas.append(InputMediaAreaUrl(
+            pos_map = {"top": 20.0, "center": 50.0, "bottom": 80.0}
+            y = pos_map.get(template.button_pos or "bottom", 80.0)
+            area = MediaAreaUrl(
                 coordinates=MediaAreaCoordinates(
-                    x=20.0,          # 20% от левого края
-                    y=pos_y * 100,   # конвертируем 0-1 → 0-100
-                    w=60.0,          # ширина 60%
-                    h=10.0,          # высота 10%
+                    x=30.0,
+                    y=y,
+                    w=40.0,
+                    h=10.0,
                     rotation=0.0,
                 ),
                 url=button_url,
-            ))
-            logger.info("[STORY] %s: кнопка url=%s", account.phone, button_url)
+            )
+            media_areas.append(area)
+            logger.info(
+                "[STORY] @%s: кнопка pos=%s y=%.0f url=%s",
+                account.username or account.phone,
+                template.button_pos, y, button_url,
+            )
 
-        # Публикуем
-        await tc(functions.stories.SendStoryRequest(
-            peer=await tc.get_me(),
+        # Отправляем сторис
+        await tc(tl_functions.stories.SendStoryRequest(
+            peer="me",
             media=media,
             caption=caption,
             media_areas=media_areas if media_areas else None,
             period=86400,
             privacy_rules=[InputPrivacyValueAllowAll()],
-            random_id=random.randint(0, 2**31),
+            random_id=random.randint(1, 2**31),
             pinned=False,
             noforwards=False,
         ))
 
-        now_str = datetime.utcnow().strftime("%d.%m %H:%M:%S")
-        logger.info("[STORY] ✅ %s: СТОРИС ОПУБЛИКОВАНА в %s (%d отметок, файл: %s)",
-                    account.phone, now_str, len(users), photo_path)
-        db_update_account_stats(account.id, stories_delta=1, tags_delta=len(users))
+        logger.info(
+            "[STORY] ✅ @%s: история опубликована | отметок: %d | кнопка: %s",
+            account.username or account.phone,
+            len(users),
+            button_url or "нет",
+        )
         return True
 
     except Exception as exc:
-        logger.error("[STORY] ❌ %s: ОШИБКА при публикации: %s", account.phone, exc)
+        logger.error(
+            "[STORY] ❌ @%s: ошибка — %s",
+            account.username or account.phone, exc,
+        )
         return False
     finally:
-        if tc:
-            try: await tc.disconnect()
-            except Exception: pass
+        # НЕ отключаем — клиент кешируется в _telethon_clients
+        pass
+
 
 async def _run_flow(flow_id: int) -> None:
     logger.info("[FLOW %d] started", flow_id)
     sent = 0; tagged = 0; daily = 0
     day_reset = datetime.utcnow().date()
+
     while True:
         flow = db_get_flow(flow_id)
         if not flow or flow.status != "running": break
         if flow.end_time and datetime.utcnow() >= flow.end_time:
             db_stop_flow(flow_id); break
+
         today = datetime.utcnow().date()
         if today != day_reset: daily = 0; day_reset = today
+
         mode = db_get_mode(flow.mode_id); template = db_get_template(flow.template_id)
         if not mode or not template: break
+
         fas = db_get_flow_accounts(flow_id)
         if not fas: break
+        load_list = [(fa.account_id, fa.load_pct) for fa in fas]
+
         if daily >= mode.daily_limit:
-            msg = f"Лимит {mode.daily_limit} сторис/день. Жду 1ч."
-            db_update_flow_stats(flow_id, sent, tagged, msg)
+            db_update_flow_stats(flow_id, sent, tagged, f"Лимит {mode.daily_limit}/день. Жду 1ч.")
             await asyncio.sleep(3600); continue
+
         keywords = db_get_user_keywords(flow.sphere_id)
+
         for _ in range(mode.stories_per_batch):
             flow = db_get_flow(flow_id)
             if not flow or flow.status != "running": break
             if flow.end_time and datetime.utcnow() >= flow.end_time: break
             if daily >= mode.daily_limit: break
-            # Выбор аккаунта по нагрузке (весовой)
-            total_pct = sum(fa.load_pct for fa in fas)
-            r = random.randint(0, max(total_pct - 1, 0))
-            chosen = fas[0]; acc_sum = 0
-            for fa in fas:
-                acc_sum += fa.load_pct
-                if r < acc_sum: chosen = fa; break
-            account = db_get_account(chosen.account_id)
+
+            # Весовой выбор аккаунта (вероятностно)
+            aid     = _weighted_choice(load_list)
+            account = db_get_account(aid)
             if not account or not account.is_active: continue
+
             n     = random.randint(mode.mentions_min, mode.mentions_max)
             users = _pick_users(flow.sphere_id, mode, keywords, n)
             ok    = await _publish_story(account, template, users)
+
             if ok:
                 sent += 1; daily += 1; tagged += len(users)
-                now_str = datetime.utcnow().strftime("%d.%m %H:%M:%S")
-                db_update_flow_stats(flow_id, sent, tagged,
-                    f"✅ Сторис #{sent} опубликована {now_str} | "
-                    f"@{account.username or account.phone} | {len(users)} отметок")
                 interval = random.randint(mode.interval_min * 60, mode.interval_max * 60)
-                db_update_account_stats(account.id, stories_delta=1, tags_delta=len(users),
-                                        interval_min=interval // 60)
-                next_time = (datetime.utcnow() + timedelta(seconds=interval)).strftime("%H:%M")
-                db_update_flow_stats(flow_id, sent, tagged,
-                    f"⏳ Жду {interval // 60} мин (след. публикация ~{next_time})")
+                db_update_account_stats(aid, stories_delta=1, tags_delta=len(users), interval_min=interval // 60)
+                now_str = datetime.utcnow().strftime("%H:%M:%S")
+                log = (
+                    f"✅ [{now_str}] История #{sent} опубликована | "
+                    f"@{account.username or account.phone} | "
+                    f"{len(users)} отметок"
+                )
+                logger.info("[FLOW %d] %s", flow_id, log)
+                db_update_flow_stats(flow_id, sent, tagged, log)
+                db_update_flow_stats(flow_id, sent, tagged, f"⏳ Жду {interval // 60} мин")
                 await asyncio.sleep(interval)
             else:
-                db_update_flow_stats(flow_id, sent, tagged,
-                    f"❌ Ошибка публикации | @{account.username or account.phone} — смотри логи")
-                # Небольшая пауза после ошибки чтобы не спамить
-                await asyncio.sleep(30)
+                now_str = datetime.utcnow().strftime("%H:%M:%S")
+                err_log = f"❌ [{now_str}] Ошибка публикации | @{account.username or account.phone}"
+                logger.error("[FLOW %d] %s", flow_id, err_log)
+                db_update_flow_stats(flow_id, sent, tagged, err_log)
+                await asyncio.sleep(30)  # короткая пауза после ошибки
 
-        rest = random.randint(mode.rest_minutes_min * 60, mode.rest_minutes_max * 60)
-        wake_time = (datetime.utcnow() + timedelta(seconds=rest)).strftime("%H:%M")
-        db_update_flow_stats(flow_id, sent, tagged,
-            f"💤 Пауза после батча: {rest // 60} мин (продолжу в ~{wake_time})")
+        rest    = random.randint(mode.rest_minutes_min * 60, mode.rest_minutes_max * 60)
+        now_str = datetime.utcnow().strftime("%H:%M:%S")
+        rest_log = f"⏸ [{now_str}] Пауза {rest // 60} мин после батча (следующий батч в {(datetime.utcnow() + timedelta(seconds=rest)).strftime('%H:%M')})"
+        logger.info("[FLOW %d] %s", flow_id, rest_log)
+        db_update_flow_stats(flow_id, sent, tagged, rest_log)
         await asyncio.sleep(rest)
+
     _active_flows.pop(flow_id, None)
     logger.info("[FLOW %d] done. sent=%d tagged=%d", flow_id, sent, tagged)
 
@@ -999,226 +1295,258 @@ async def _run_flow(flow_id: int) -> None:
 # ===========================================================================
 
 (
-    STATE_MAIN_MENU,           # 0
-    STATE_SPHERE_MENU,         # 1
-    STATE_ADD_SPHERE_NAME,     # 2
-    STATE_AFTER_STAGE,         # 3
-    STATE_ADD_STAGE_DESC,      # 4
-    STATE_ADD_STAGE_SCRIPT,    # 5
-    STATE_ADD_GROUP_KEYWORDS,  # 6
-    STATE_ADD_USER_KEYWORDS,   # 7
-    STATE_ADD_GROUP_LINKS,     # 8
-    STATE_SHOW_CLIENT,         # 9
-    STATE_EDIT_SCRIPT_CHOOSE,  # 10
-    STATE_EDIT_SCRIPT_DESC,    # 11
-    STATE_EDIT_SCRIPT_TEXT,    # 12
-    STATE_EDIT_KEYS_GROUP,     # 13
-    STATE_EDIT_KEYS_USER,      # 14
-    STATE_REDO_STAGE_DESC,     # 15
-    STATE_REDO_STAGE_SCRIPT,   # 16
-    STATE_STORY_MENU,          # 17
-    STATE_ACCOUNTS_MENU,       # 18  ← раздел аккаунтов
-    STATE_ADD_ACC_PHONE,       # 19
-    STATE_ADD_ACC_CODE,        # 20
-    STATE_ADD_ACC_PASS,        # 21
-    STATE_STORY_CHOOSE_SPHERE, # 22
-    STATE_STORY_TMPL_MENU,     # 23
-    STATE_STORY_NEW_TMPL_NAME, # 24
-    STATE_STORY_ADD_PHOTO,     # 25
-    STATE_STORY_ADD_TEXT,      # 26
-    STATE_STORY_BTN_TEXT,      # 27
-    STATE_STORY_BTN_MSG,       # 28
-    STATE_STORY_BTN_POS,       # 29
-    STATE_STORY_CHOOSE_MODE,   # 30
-    STATE_STORY_CHOOSE_TIME,   # 31
-    STATE_STORY_CUSTOM_TIME,   # 32
-    STATE_STORY_SELECT_ACCS,   # 33  ← выбор аккаунтов для потока
-    STATE_STORY_LOAD_DIST,     # 34
-    STATE_STORY_LOAD_MANUAL,   # 35
-    STATE_FLOWS_MENU,          # 36
-    STATE_FLOW_DETAIL,         # 37
-) = range(38)
+    # Основное
+    S_MAIN,          # 0
+    S_SPHERE,        # 1
+    S_ADD_SPHERE,    # 2
+    S_AFTER_STAGE,   # 3
+    S_STAGE_DESC,    # 4
+    S_STAGE_SCRIPT,  # 5
+    S_ADD_GRP_LINKS, # 6  ← ввод ссылок на группы
+    S_ADD_USR_KWS,   # 7  ← ввод ключевых слов
+    S_SHOW_CLIENT,   # 8
+    S_EDIT_CHOOSE,   # 9
+    S_EDIT_DESC,     # 10
+    S_EDIT_TEXT,     # 11
+    S_EDIT_GRP,      # 12
+    S_EDIT_USR,      # 13
+    S_REDO_DESC,     # 14
+    S_REDO_SCRIPT,   # 15
+    # Сторис главное
+    S_STORY,         # 16
+    # Аккаунты
+    S_ACCOUNTS,      # 17
+    S_ACC_TELETHON,  # 18  ← ввод Telethon session string
+    S_ACC_PYROGRAM,  # 19  ← ввод Pyrogram session string
+    S_ACC_PHONE,     # 20  ← алиас для совместимости FSM
+    S_ACC_CODE,      # 21  ← не используется (заглушка)
+    S_ACC_PASS,      # 22  ← не используется (заглушка)
+    # Запуск потока
+    S_RUN_SPHERE,    # 21
+    S_RUN_TMPL,      # 22
+    S_NEW_TMPL,      # 23
+    S_PHOTO,         # 24
+    S_TEXT,          # 25
+    S_BTN_TEXT,      # 26
+    S_BTN_MSG,       # 27
+    S_BTN_POS,       # 28
+    S_MODE,          # 29
+    S_TIME,          # 30
+    S_CUSTOM_TIME,   # 31
+    # Выбор аккаунтов + нагрузка
+    S_SEL_ACCS,      # 32
+    S_LOAD_DIST,     # 33
+    S_LOAD_MANUAL,   # 34
+    # Потоки
+    S_FLOWS,         # 35
+    S_FLOW_DETAIL,   # 36
+    # Новые состояния
+    S_EDIT_DATA,     # 37  ← меню "Изменить данные"
+    S_ADD_GRP_NOW,   # 38  ← добавление групп из экрана клиента
+    S_CONFIRM_DEL,   # 39  ← подтверждение удаления сферы
+) = range(42)
 
 # ===========================================================================
 # KEYBOARDS
 # ===========================================================================
 
+def kb(buttons, resize=True):
+    """Быстрое создание клавиатуры из списка списков строк."""
+    rows = [[KeyboardButton(b) for b in row] for row in buttons]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=resize)
+
 def kb_main():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("🖐🏻 Ручной поиск")],
-        [KeyboardButton("📸 Отметки сторис")],
-    ], resize_keyboard=True)
+    return kb([["🖐🏻 Ручной поиск"], ["📸 Отметки сторис"]])
 
 def kb_sphere():
-    spheres = db_get_spheres()
-    btns = [[KeyboardButton(s.name)] for s in spheres]
-    btns += [[KeyboardButton("➕ Добавить сферу")], [KeyboardButton("🏠 Главное меню")]]
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    btns = [[s.name] for s in db_get_spheres()]
+    btns += [["➕ Добавить сферу"], ["🏠 Главное меню"]]
+    return kb(btns)
 
 def kb_client():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("➡️ Следующий")],
-        [KeyboardButton("✏️ Изменить скрипт"), KeyboardButton("🔑 Изменить ключи")],
-        [KeyboardButton("🏠 Главное меню"),     KeyboardButton("🗑 Удалить сферу")],
-    ], resize_keyboard=True)
+    return kb([
+        ["➡️ Следующий"],
+        ["✏️ Изменить данные", "➕ Добавить группы"],
+        ["🏠 Главное меню",   "🗑 Удалить сферу"],
+    ])
+
+def kb_edit_data():
+    """Меню выбора что изменить."""
+    return kb([["✏️ Изменить скрипт"], ["🔑 Изменить ключи"], ["🔙 Назад"]])
 
 def kb_after_stage():
-    return ReplyKeyboardMarkup([[KeyboardButton("+Этап"), KeyboardButton("Продолжить")]], resize_keyboard=True)
+    return kb([["+Этап", "Продолжить"]])
 
 def kb_edit_script(stages):
-    btns, row = [], []
+    btns = []; row = []
     for i in range(len(stages)):
-        row.append(KeyboardButton(str(i + 1)))
+        row.append(str(i + 1))
         if len(row) == 2: btns.append(row); row = []
     if row: btns.append(row)
-    btns.append([KeyboardButton("Все"), KeyboardButton("Назад")])
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    btns.append(["Все", "Назад"])
+    return kb(btns)
 
-def kb_story_main():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("▶️ Запустить")],
-        [KeyboardButton("🛠 Потоки"), KeyboardButton("👤 Аккаунты")],
-        [KeyboardButton("🏠 Главное меню")],
-    ], resize_keyboard=True)
+def kb_story():
+    return kb([["▶️ Запустить"], ["🛠 Потоки", "👤 Аккаунты"], ["🏠 Главное меню"]])
 
 def kb_accounts(accounts: list):
-    """Клавиатура раздела Аккаунты — каждый аккаунт отдельной кнопкой."""
     btns = []
     for acc in accounts:
-        load   = db_get_account_load_pct(acc.id)
-        status = "🟢" if acc.is_active else "🔴"
-        # Формат: "acc_ID" — по нему будем искать в хендлере
-        btns.append([KeyboardButton(f"{status} @{acc.username or acc.phone} ({load}%) [id:{acc.id}]")])
-    btns.append([KeyboardButton("➕ Добавить аккаунт")])
-    btns.append([KeyboardButton("🔙 Назад")])
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+        load    = db_get_account_load_pct(acc.id)
+        status  = "🔴" if load > 70 else "🟢"
+        premium = " ⭐️" if getattr(acc, "is_premium", False) else ""
+        # Храним id скрыто для идентификации при нажатии
+        label = f"{status} @{acc.username or acc.phone}{premium} [id:{acc.id}]"
+        btns.append([label])
+    btns.append(["➕ Добавить аккаунт"])
+    btns.append(["🔙 Назад"])
+    return kb(btns)
 
 def kb_templates(templates):
-    btns = [[KeyboardButton(f"📋 {t.name}")] for t in templates]
-    btns += [[KeyboardButton("➕ Новый шаблон")], [KeyboardButton("🔙 Назад")]]
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    btns = [[f"📋 {t.name}"] for t in templates]
+    btns += [["➕ Новый шаблон"], ["🔙 Назад"]]
+    return kb(btns)
 
 def kb_modes(modes):
-    btns = [[KeyboardButton(m.name)] for m in modes]
-    btns.append([KeyboardButton("🔙 Назад")])
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    btns = [[m.name] for m in modes]
+    btns.append(["🔙 Назад"])
+    return kb(btns)
 
 def kb_time():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("⏱ 20 минут"),      KeyboardButton("📅 1 день")],
-        [KeyboardButton("♾ До отключения"), KeyboardButton("🗓 Своя дата")],
-        [KeyboardButton("🔙 Назад")],
-    ], resize_keyboard=True)
+    return kb([["⏱ 20 минут", "📅 1 день"], ["♾ До отключения", "🗓 Своя дата"], ["🔙 Назад"]])
 
 def kb_btn_pos():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("⬆️ Вверху"), KeyboardButton("⏺ По центру"), KeyboardButton("⬇️ Внизу")],
-    ], resize_keyboard=True)
+    return kb([["⬆️ Вверху", "⏺ По центру", "⬇️ Внизу"]])
 
 def kb_select_accs(accounts: list, selected_ids: list):
-    """Выбор аккаунтов для потока — галочка у выбранных."""
     btns = []
     for acc in accounts:
-        mark = "✅" if acc.id in selected_ids else "◻️"
-        load = db_get_account_load_pct(acc.id)
-        st   = "🟢" if acc.is_active else "🔴"
-        btns.append([KeyboardButton(f"{mark} @{acc.username or acc.phone} {st} нагрузка {load}% [id:{acc.id}]")])
-    btns.append([KeyboardButton("➡️ Продолжить")])
-    btns.append([KeyboardButton("🔙 Назад")])
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+        mark    = "✅" if acc.id in selected_ids else "◻️"
+        load    = db_get_account_load_pct(acc.id)
+        st      = "🔴" if load > 70 else "🟢"
+        premium = " ⭐️" if getattr(acc, "is_premium", False) else ""
+        btns.append([f"{mark} {st} @{acc.username or acc.phone}{premium} нагрузка {load}% [id:{acc.id}]"])
+    btns.append(["➡️ Продолжить"])
+    btns.append(["🔙 Назад"])
+    return kb(btns)
+
+def kb_load(load: list, show_change: bool = True):
+    btns = []
+    if show_change and len(load) > 1: btns.append(["🔧 Изменить нагрузку"])
+    btns.append(["➕ Добавить аккаунт", "➡️ Продолжить"])
+    btns.append(["🔙 Назад"])
+    return kb(btns)
 
 def kb_load_dist():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("✋ Ручной")],
-        [KeyboardButton("⚖️ Равномерно")],
-        [KeyboardButton("🧠 Умное распределение")],
-        [KeyboardButton("🔙 Назад")],
-    ], resize_keyboard=True)
+    return kb([["✋ Ручной"], ["⚖️ Равномерно"], ["🧠 Умное распределение"], ["🔙 Назад"]])
 
 def kb_flows(flows):
     btns = []
     for f in flows:
         s = "🟢" if f.status == "running" else ("⚪" if f.status == "done" else "🔴")
-        btns.append([KeyboardButton(f"{s} Поток #{f.id} — {f.stories_sent} сторис [id:{f.id}]")])
-    btns.append([KeyboardButton("🔙 Назад")])
-    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+        btns.append([f"{s} Поток #{f.id} — {f.stories_sent} сторис [id:{f.id}]"])
+    btns.append(["🔙 Назад"])
+    return kb(btns)
 
 def kb_flow_detail():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("🛑 СТОП"),              KeyboardButton("📊 Нагрузка аккаунтов")],
-        [KeyboardButton("📋 Логи работы"),       KeyboardButton("🔙 Назад")],
-    ], resize_keyboard=True)
+    return kb([["🛑 СТОП", "📊 Нагрузка аккаунтов"], ["📋 Логи работы", "Подробнее"], ["🔙 Назад"]])
 
 def kb_confirm():
-    return ReplyKeyboardMarkup([[KeyboardButton("✅ Запустить"), KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    return kb([["✅ Запустить", "❌ Отмена"]])
 
 # ===========================================================================
 # HELPERS
 # ===========================================================================
 
 def _extract_id(text: str) -> Optional[int]:
-    """Извлекает [id:N] из текста кнопки."""
     m = re.search(r"\[id:(\d+)\]", text)
     return int(m.group(1)) if m else None
 
+def _format_load(load: list) -> str:
+    lines = ["Распределение нагрузки:"]
+    for aid, pct in load:
+        a = db_get_account(aid)
+        if a: lines.append(f"@{a.username or a.phone} 🛠️{pct}%")
+    return "\n".join(lines)
+
+def _minutes_ago(dt: datetime) -> str:
+    if not dt: return "—"
+    mins = int((datetime.utcnow() - dt).total_seconds() / 60)
+    if mins < 60: return f"{mins} мин назад"
+    h = mins // 60; return f"{h}ч {mins % 60}м назад"
+
+def _work_duration(created_at: datetime) -> str:
+    mins = int((datetime.utcnow() - created_at).total_seconds() / 60)
+    d, rem = divmod(mins, 1440); h, m = divmod(rem, 60)
+    parts = []
+    if d: parts.append(f"{d}д")
+    if h: parts.append(f"{h}ч")
+    parts.append(f"{m}м")
+    return " ".join(parts)
+
+def _make_progress_bar(current: int, total: int, width: int = 16) -> str:
+    pct    = min(100, int(current / total * 100)) if total else 0
+    filled = int(width * pct / 100)
+    return f"{'Ӏ' * filled}{' ' * (width - filled)} {pct}%"
+
 # ===========================================================================
-# HANDLERS — основное меню и сферы
+# HANDLERS — основное
 # ===========================================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Добро пожаловать!", reply_markup=kb_main())
-    return STATE_MAIN_MENU
+    return S_MAIN
 
-async def h_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🖐🏻 Ручной поиск":
+async def h_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🖐🏻 Ручной поиск":
         await update.message.reply_text("Выберите сферу:", reply_markup=kb_sphere())
-        return STATE_SPHERE_MENU
-    if text == "📸 Отметки сторис":
-        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
-    return STATE_MAIN_MENU
+        return S_SPHERE
+    if t == "📸 Отметки сторис":
+        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story())
+        return S_STORY
+    return S_MAIN
 
-async def h_sphere_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🏠 Главное меню":
+async def h_sphere(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🏠 Главное меню":
         await update.message.reply_text("Главное меню:", reply_markup=kb_main())
-        return STATE_MAIN_MENU
-    if text == "➕ Добавить сферу":
-        context.user_data["new_sphere"] = {"stages": []}
+        return S_MAIN
+    if t == "➕ Добавить сферу":
+        context.user_data["ns"] = {"stages": []}
         await update.message.reply_text("Введите название сферы:", reply_markup=ReplyKeyboardRemove())
-        return STATE_ADD_SPHERE_NAME
-    sphere = db_get_sphere_by_name(text)
+        return S_ADD_SPHERE
+    sphere = db_get_sphere_by_name(t)
     if sphere:
-        context.user_data["current_sphere_id"]   = sphere.id
-        context.user_data["current_sphere_name"] = sphere.name
+        context.user_data["sid"]   = sphere.id
+        context.user_data["sname"] = sphere.name
         if db_count_available_clients(sphere.id) > 0:
             if sphere.id not in _collecting:
                 asyncio.create_task(_fill_buffer_bg(sphere.id))
             return await show_next_client(update, context)
         prog = await update.message.reply_text(
-            f"🔍 Поиск для «{sphere.name}»...\n\n{make_progress_bar(0,1)}\n\n✅ Бот работает!",
+            f"🔍 Начинаю парсинг для «{sphere.name}»...\n\n✅ Бот работает!",
             reply_markup=kb_client(),
         )
         asyncio.create_task(_fill_buffer_bg(sphere.id, progress_message=prog))
-        return STATE_SHOW_CLIENT
+        return S_SHOW_CLIENT
     await update.message.reply_text("Сфера не найдена.", reply_markup=kb_sphere())
-    return STATE_SPHERE_MENU
+    return S_SPHERE
 
 async def show_next_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sid   = context.user_data.get("current_sphere_id")
-    sname = context.user_data.get("current_sphere_name")
+    sid   = context.user_data.get("sid")
+    sname = context.user_data.get("sname")
     if not sid:
         await update.message.reply_text("Ошибка.", reply_markup=kb_main())
-        return STATE_MAIN_MENU
+        return S_MAIN
     row = db_get_random_client(sid)
     if not row:
-        status = "Идёт сбор..." if sid in _collecting else "Запускаю сбор..."
+        status = "Идёт парсинг..." if sid in _collecting else "Запускаю парсинг..."
         await update.message.reply_text(f"⏳ Клиентов пока нет. {status}", reply_markup=kb_client())
         if sid not in _collecting: asyncio.create_task(_fill_buffer_bg(sid))
-        return STATE_SHOW_CLIENT
-    context.user_data["current_client_id"] = row.id
+        return S_SHOW_CLIENT
+    context.user_data["cid"] = row.id
     stages = db_get_stages(sid)
     lines  = [f"<b>@{row.username}</b>\n", f"<b>{sname}</b>"]
     for i, st in enumerate(stages, 1):
@@ -1227,728 +1555,1052 @@ async def show_next_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=kb_client())
     if db_count_available_clients(sid) < LOW_CLIENTS and sid not in _collecting:
         asyncio.create_task(_fill_buffer_bg(sid))
-    return STATE_SHOW_CLIENT
+    return S_SHOW_CLIENT
 
 async def h_show_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    t = update.message.text
+
     def _mark():
-        if cid := context.user_data.get("current_client_id"):
-            sid = context.user_data.get("current_sphere_id")
+        if cid := context.user_data.get("cid"):
+            sid = context.user_data.get("sid")
             gu  = db_mark_client_used(cid)
-            if gu and sid: db_increment_group_shown(gu, sid)
-    if text == "➡️ Следующий":
+            if gu and sid:
+                db_increment_group_shown(gu, sid)
+                # Удаляем пользователя из users_db чтобы не попал в сторис
+                _remove_client_from_users_db(sid, cid)
+
+    if t == "➡️ Следующий":
         _mark(); return await show_next_client(update, context)
-    if text == "🏠 Главное меню":
+
+    if t == "🏠 Главное меню":
         _mark()
-        for k in ("current_sphere_id","current_sphere_name","current_client_id"): context.user_data.pop(k, None)
+        for k in ("sid","sname","cid"): context.user_data.pop(k, None)
         await update.message.reply_text("Главное меню:", reply_markup=kb_main())
-        return STATE_MAIN_MENU
-    if text == "🗑 Удалить сферу":
-        sid = context.user_data.get("current_sphere_id"); sname = context.user_data.get("current_sphere_name")
+        return S_MAIN
+
+    if t == "🗑 Удалить сферу":
+        sname = context.user_data.get("sname", "")
+        await update.message.reply_text(
+            f"Вы уверены что хотите удалить сферу «{sname}»?\n\nВсе данные будут потеряны.",
+            reply_markup=kb([["✅ Да, удалить", "❌ Отмена"]]),
+        )
+        return S_CONFIRM_DEL
+
+    if t == "✏️ Изменить данные":
+        await update.message.reply_text("Что хотите изменить?", reply_markup=kb_edit_data())
+        return S_EDIT_DATA
+
+    if t == "➕ Добавить группы":
+        sid = context.user_data.get("sid")
+        sp  = db_get_sphere(sid)
+        gl  = json.loads(sp.group_links or "[]") if sp else []
+        gl_text = "\n".join(gl) if gl else "(нет)"
+        await update.message.reply_text(
+            f"Добавленные группы/чаты:\n{gl_text}\n\nДобавьте группы/чаты списком:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return S_ADD_GRP_NOW
+
+    return S_SHOW_CLIENT
+
+
+async def h_confirm_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение удаления сферы."""
+    t = update.message.text
+    if t == "✅ Да, удалить":
+        sid   = context.user_data.get("sid")
+        sname = context.user_data.get("sname", "")
         if sid:
-            db_delete_sphere(sid); _collecting.discard(sid)
-            for k in ("current_sphere_id","current_sphere_name","current_client_id"): context.user_data.pop(k, None)
+            db_delete_sphere(sid)
+            _collecting.discard(sid)
+            for k in ("sid","sname","cid"): context.user_data.pop(k, None)
             await update.message.reply_text(f"🗑 Сфера «{sname}» удалена.", reply_markup=kb_sphere())
-        return STATE_SPHERE_MENU
-    if text == "✏️ Изменить скрипт":
-        sid = context.user_data.get("current_sphere_id"); stages = db_get_stages(sid)
+            return S_SPHERE
+    await update.message.reply_text("Отменено.", reply_markup=kb_client())
+    return S_SHOW_CLIENT
+
+
+async def h_edit_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню 'Изменить данные' — выбор что именно менять."""
+    t = update.message.text
+
+    if t == "🔙 Назад":
+        await update.message.reply_text("Возврат:", reply_markup=kb_client())
+        return S_SHOW_CLIENT
+
+    if t == "✏️ Изменить скрипт":
+        sid    = context.user_data.get("sid")
+        stages = db_get_stages(sid)
         if not stages:
-            await update.message.reply_text("Этапов нет.", reply_markup=kb_client()); return STATE_SHOW_CLIENT
+            await update.message.reply_text("Этапов нет.", reply_markup=kb_client())
+            return S_SHOW_CLIENT
         context.user_data["edit_stages"] = [{"id": st.id, "desc": st.description, "script": st.script} for st in stages]
         await update.message.reply_text("Какой этап?", reply_markup=kb_edit_script(stages))
-        return STATE_EDIT_SCRIPT_CHOOSE
-    if text == "🔑 Изменить ключи":
-        sid = context.user_data.get("current_sphere_id"); sp = db_get_sphere(sid)
-        if sp:
-            kws = json.loads(sp.group_keywords or "[]")
-            await update.message.reply_text(f"Ключи групп:\n{chr(10).join(kws)}\n\nВведите новые:", reply_markup=ReplyKeyboardRemove())
-            return STATE_EDIT_KEYS_GROUP
-    return STATE_SHOW_CLIENT
+        return S_EDIT_CHOOSE
 
-async def h_edit_script_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text; stages = context.user_data.get("edit_stages", [])
-    if text == "Назад":
-        await update.message.reply_text("Возврат:", reply_markup=kb_client()); return STATE_SHOW_CLIENT
-    if text == "Все":
-        sid = context.user_data.get("current_sphere_id"); db_delete_stages(sid)
-        context.user_data["new_sphere"] = {"stages": [], "redo": True}
+    if t == "🔑 Изменить ключи":
+        sid = context.user_data.get("sid")
+        sp  = db_get_sphere(sid)
+        if sp:
+            gl = json.loads(sp.group_links or "[]")
+            await update.message.reply_text(
+                f"Текущие ссылки ({len(gl)} шт.):\n{chr(10).join(gl) if gl else '(нет)'}\n\nВведите новые ссылки (каждая с новой строки):",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return S_EDIT_GRP
+
+    return S_EDIT_DATA
+
+
+async def h_add_grp_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление групп прямо из экрана клиента."""
+    raw  = update.message.text.strip()
+    new_links = [l.strip() for l in raw.splitlines() if l.strip()]
+    if not new_links:
+        await update.message.reply_text("Введите хотя бы одну ссылку:")
+        return S_ADD_GRP_NOW
+
+    sid = context.user_data.get("sid")
+    sp  = db_get_sphere(sid)
+    if sp:
+        existing = json.loads(sp.group_links or "[]")
+        # Нормализуем новые ссылки
+        normalized = []
+        for l in new_links:
+            if not l.startswith("https://"):
+                l = f"https://t.me/{l.lstrip('@').lstrip('t.me/').lstrip('/')}"
+            if l not in existing:
+                normalized.append(l)
+        combined = existing + normalized
+        db_update_sphere(sid, group_links=combined)
+        # Запускаем парсинг новых групп в фоне
+        if normalized:
+            asyncio.create_task(_fill_buffer_bg(sid))
+
+    await update.message.reply_text(
+        f"Группы добавлены✅",
+        reply_markup=kb_main(),
+    )
+    return S_MAIN
+
+async def h_edit_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text; stages = context.user_data.get("edit_stages", [])
+    if t == "Назад":
+        await update.message.reply_text("Возврат:", reply_markup=kb_client()); return S_SHOW_CLIENT
+    if t == "Все":
+        sid = context.user_data.get("sid"); db_delete_stages(sid)
+        context.user_data["ns"] = {"stages": [], "redo": True}
         await update.message.reply_text("Введите пояснение 1-го этапа:", reply_markup=ReplyKeyboardRemove())
-        return STATE_REDO_STAGE_DESC
+        return S_REDO_DESC
     try:
-        idx = int(text) - 1
+        idx = int(t) - 1
         if 0 <= idx < len(stages):
-            context.user_data["editing_stage_idx"] = idx; st = stages[idx]
+            context.user_data["edit_idx"] = idx; st = stages[idx]
             await update.message.reply_text(f"Этап {idx+1}: «{st['desc']}»\n\nНовое пояснение:", reply_markup=ReplyKeyboardRemove())
-            return STATE_EDIT_SCRIPT_DESC
+            return S_EDIT_DESC
     except ValueError: pass
     await update.message.reply_text("Выберите номер:", reply_markup=kb_edit_script(stages))
-    return STATE_EDIT_SCRIPT_CHOOSE
+    return S_EDIT_CHOOSE
 
-async def h_edit_script_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_stage_desc"] = update.message.text.strip()
-    await update.message.reply_text("Введите новый скрипт:"); return STATE_EDIT_SCRIPT_TEXT
+async def h_edit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["edit_new_desc"] = update.message.text.strip()
+    await update.message.reply_text("Введите новый скрипт:"); return S_EDIT_TEXT
 
-async def h_edit_script_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    new_script = update.message.text.strip(); new_desc = context.user_data.pop("new_stage_desc", "")
-    idx = context.user_data.get("editing_stage_idx", 0); stages = context.user_data.get("edit_stages", [])
-    if 0 <= idx < len(stages): db_update_stage(stages[idx]["id"], new_desc, new_script)
+async def h_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    script   = update.message.text.strip()
+    new_desc = context.user_data.pop("edit_new_desc", "")
+    idx      = context.user_data.get("edit_idx", 0)
+    stages   = context.user_data.get("edit_stages", [])
+    if 0 <= idx < len(stages): db_update_stage(stages[idx]["id"], new_desc, script)
     await update.message.reply_text("Данные изменены ✅", reply_markup=kb_main())
-    return STATE_MAIN_MENU
+    return S_MAIN
 
-async def h_redo_stage_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_sphere"]["current_stage_desc"] = update.message.text.strip()
-    await update.message.reply_text("Введите текст скрипта:"); return STATE_REDO_STAGE_SCRIPT
+async def h_redo_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["ns"]["current_desc"] = update.message.text.strip()
+    await update.message.reply_text("Введите текст скрипта:"); return S_REDO_SCRIPT
 
-async def h_redo_stage_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    script = update.message.text.strip(); desc = context.user_data["new_sphere"].pop("current_stage_desc", "")
-    context.user_data["new_sphere"]["stages"].append({"desc": desc, "script": script})
+async def h_redo_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    script = update.message.text.strip(); desc = context.user_data["ns"].pop("current_desc", "")
+    context.user_data["ns"]["stages"].append({"desc": desc, "script": script})
     await update.message.reply_text("✅ Этап сохранён.", reply_markup=kb_after_stage())
-    return STATE_AFTER_STAGE
+    return S_AFTER_STAGE
 
-async def h_edit_keys_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kws = [k.strip() for k in update.message.text.strip().splitlines() if k.strip()]
-    context.user_data["new_group_kws"] = kws
-    sid = context.user_data.get("current_sphere_id"); sp = db_get_sphere(sid)
+async def h_edit_grp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    links = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
+    context.user_data["new_links"] = links
+    sid = context.user_data.get("sid"); sp = db_get_sphere(sid)
     ukws = json.loads(sp.user_keywords or "[]") if sp else []
     await update.message.reply_text(
-        f"Ключи пользователей:\n{chr(10).join(ukws) if ukws else '(не заданы)'}\n\nВведите новые (или «нет»):",
+        f"Текущие ключевые слова:\n{chr(10).join(ukws) if ukws else '(не заданы)'}\n\n"
+        f"Введите новые ключевые слова (или «нет»):",
         reply_markup=ReplyKeyboardRemove(),
     )
-    return STATE_EDIT_KEYS_USER
+    return S_EDIT_USR
 
-async def h_edit_keys_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    ukws = [] if raw.lower() in ("нет","no","-","") else [k.strip() for k in raw.splitlines() if k.strip()]
-    sid = context.user_data.get("current_sphere_id"); gkws = context.user_data.pop("new_group_kws", [])
-    db_update_sphere_keywords(sid, json.dumps(gkws, ensure_ascii=False), json.dumps(ukws, ensure_ascii=False))
-    await update.message.reply_text("Ключи обновлены ✅", reply_markup=kb_main())
-    return STATE_MAIN_MENU
-
-async def h_add_sphere_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if not name: await update.message.reply_text("Введите название:"); return STATE_ADD_SPHERE_NAME
-    context.user_data["new_sphere"]["name"] = name
-    await update.message.reply_text("Добавьте этапы:", reply_markup=kb_after_stage())
-    return STATE_AFTER_STAGE
-
-async def h_after_stage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text; ns = context.user_data.get("new_sphere", {})
-    if text == "+Этап":
-        await update.message.reply_text("Введите пояснение:", reply_markup=ReplyKeyboardRemove())
-        return STATE_REDO_STAGE_DESC if ns.get("redo") else STATE_ADD_STAGE_DESC
-    if text == "Продолжить":
-        if ns.get("redo"):
-            sid = context.user_data.get("current_sphere_id")
-            for st in ns.get("stages", []): db_add_stage(sid, st["desc"], st["script"])
-            context.user_data.pop("new_sphere", None)
-            await update.message.reply_text("Данные изменены ✅", reply_markup=kb_main())
-            return STATE_MAIN_MENU
-        await update.message.reply_text("📌 Шаг 1 из 3: Ключевые слова для групп\n(каждое с новой строки):", reply_markup=ReplyKeyboardRemove())
-        return STATE_ADD_GROUP_KEYWORDS
-    return STATE_AFTER_STAGE
-
-async def h_add_stage_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_sphere"]["current_stage_desc"] = update.message.text.strip()
-    await update.message.reply_text("Введите текст скрипта:"); return STATE_ADD_STAGE_SCRIPT
-
-async def h_add_stage_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    script = update.message.text.strip(); desc = context.user_data["new_sphere"].pop("current_stage_desc", "")
-    context.user_data["new_sphere"]["stages"].append({"desc": desc, "script": script})
-    await update.message.reply_text("✅ Этап сохранён.", reply_markup=kb_after_stage())
-    return STATE_AFTER_STAGE
-
-async def h_add_group_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kws = [k.strip() for k in update.message.text.strip().splitlines() if k.strip()]
-    if not kws: await update.message.reply_text("Введите хотя бы одно слово:"); return STATE_ADD_GROUP_KEYWORDS
-    context.user_data["new_sphere"]["group_keywords"] = kws
-    await update.message.reply_text("📌 Шаг 2 из 3: Ключевые слова для фильтрации пользователей\n(или «нет»):", reply_markup=ReplyKeyboardRemove())
-    return STATE_ADD_USER_KEYWORDS
-
-async def h_add_user_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def h_edit_usr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw  = update.message.text.strip()
     ukws = [] if raw.lower() in ("нет","no","-","") else [k.strip() for k in raw.splitlines() if k.strip()]
-    context.user_data["new_sphere"]["user_keywords"] = ukws
-    await update.message.reply_text(
-        "📌 Шаг 3 из 3: Ссылки на группы для парсинга\n"
-        "(каждая с новой строки)\n\nИли «пропустить» — бот найдёт сам:",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("пропустить")]], resize_keyboard=True),
-    )
-    return STATE_ADD_GROUP_LINKS
+    sid  = context.user_data.get("sid")
+    links = context.user_data.pop("new_links", [])
+    db_update_sphere(sid, group_links=links, user_keywords=ukws)
+    await update.message.reply_text("✅ Обновлено!", reply_markup=kb_main())
+    return S_MAIN
 
-async def h_add_group_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    group_links = [] if raw.lower() == "пропустить" else [l.strip() for l in raw.splitlines() if l.strip()]
-    ns = context.user_data.get("new_sphere", {})
-    name = ns.get("name",""); stages = ns.get("stages",[]); gkws = ns.get("group_keywords",[]); ukws = ns.get("user_keywords",[])
-    sid = db_add_sphere(name=name, group_keywords=json.dumps(gkws, ensure_ascii=False), user_keywords=json.dumps(ukws, ensure_ascii=False))
-    if group_links: db_update_sphere_group_links(sid, group_links)
+async def h_add_sphere(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name: await update.message.reply_text("Введите название:"); return S_ADD_SPHERE
+    context.user_data["ns"]["name"] = name
+    await update.message.reply_text("Добавьте этапы переписки:", reply_markup=kb_after_stage())
+    return S_AFTER_STAGE
+
+async def h_after_stage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t  = update.message.text; ns = context.user_data.get("ns", {})
+    if t == "+Этап":
+        await update.message.reply_text("Введите пояснение этапа:", reply_markup=ReplyKeyboardRemove())
+        return S_REDO_DESC if ns.get("redo") else S_STAGE_DESC
+    if t == "Продолжить":
+        if ns.get("redo"):
+            sid = context.user_data.get("sid")
+            for st in ns.get("stages", []): db_add_stage(sid, st["desc"], st["script"])
+            context.user_data.pop("ns", None)
+            await update.message.reply_text("Данные изменены ✅", reply_markup=kb_main())
+            return S_MAIN
+        await update.message.reply_text(
+            "📌 Шаг 1 из 2: Введите ссылки на группы/чаты для парсинга\n"
+            "(каждая с новой строки)\n\nПример:\nhttps://t.me/groupname\nt.me/another",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return S_ADD_GRP_LINKS
+    return S_AFTER_STAGE
+
+async def h_stage_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["ns"]["current_desc"] = update.message.text.strip()
+    await update.message.reply_text("Введите текст скрипта:"); return S_STAGE_SCRIPT
+
+async def h_stage_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    script = update.message.text.strip(); desc = context.user_data["ns"].pop("current_desc", "")
+    context.user_data["ns"]["stages"].append({"desc": desc, "script": script})
+    await update.message.reply_text("✅ Этап сохранён.", reply_markup=kb_after_stage())
+    return S_AFTER_STAGE
+
+async def h_add_grp_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    links = [l.strip() for l in update.message.text.strip().splitlines() if l.strip()]
+    if not links:
+        await update.message.reply_text("Введите хотя бы одну ссылку:"); return S_ADD_GRP_LINKS
+    context.user_data["ns"]["group_links"] = links
+    await update.message.reply_text(
+        "📌 Шаг 2 из 2: Ключевые слова для фильтрации пользователей\n"
+        "(username, имя, bio)\n\nЕсли не нужно — напишите «нет»:",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("нет")]], resize_keyboard=True),
+    )
+    return S_ADD_USR_KWS
+
+async def h_add_usr_kws(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw  = update.message.text.strip()
+    ukws = [] if raw.lower() in ("нет","no","-","") else [k.strip() for k in raw.splitlines() if k.strip()]
+    ns   = context.user_data.get("ns", {})
+    name = ns.get("name",""); stages = ns.get("stages",[]); links = ns.get("group_links",[])
+
+    sid = db_add_sphere(name=name, group_links=links, user_keywords=ukws)
     for st in stages: db_add_stage(sid, st["desc"], st["script"])
-    info = f"Групп добавлено: {len(group_links)}" if group_links else "Группы найдутся автоматически"
-    await update.message.reply_text(f"💾 Сфера «{name}» сохранена!\n{info}\n\n🔍 Поиск запущен в фоне.")
-    prog = await update.message.reply_text(f"🔍 Поиск групп...\n\n{make_progress_bar(0,1)}")
+
+    kw_info = f"Ключевых слов: {len(ukws)}" if ukws else "Фильтрация: отключена"
+    await update.message.reply_text(
+        f"💾 Сфера «{name}» создана!\n"
+        f"Групп для парсинга: {len(links)}\n{kw_info}\n\n"
+        f"🔍 Парсинг запущен в фоне. Бот уже работает!"
+    )
+    prog = await update.message.reply_text("👥 Начинаю парсинг групп...")
     asyncio.create_task(_fill_buffer_bg(sid, progress_message=prog))
-    context.user_data.pop("new_sphere", None)
+    context.user_data.pop("ns", None)
     await update.message.reply_text("Выберите сферу:", reply_markup=kb_sphere())
-    return STATE_SPHERE_MENU
+    return S_SPHERE
 
 # ===========================================================================
 # HANDLERS — 📸 Отметки сторис
 # ===========================================================================
 
-async def h_story_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🏠 Главное меню":
-        await update.message.reply_text("Главное меню:", reply_markup=kb_main())
-        return STATE_MAIN_MENU
-
-    if text == "👤 Аккаунты":
+async def h_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🏠 Главное меню":
+        await update.message.reply_text("Главное меню:", reply_markup=kb_main()); return S_MAIN
+    if t == "👤 Аккаунты":
         accounts = db_get_accounts()
-        msg = f"👤 Аккаунты ({len(accounts)} шт.)\n\nНажмите на аккаунт для просмотра карточки:"
-        await update.message.reply_text(msg, reply_markup=kb_accounts(accounts))
-        return STATE_ACCOUNTS_MENU
-
-    if text == "▶️ Запустить":
+        await update.message.reply_text(
+            f"👤 Аккаунты ({len(accounts)} шт.)\n\n🟢 — низкая нагрузка  🔴 — высокая нагрузка\n\nНажмите на аккаунт для карточки:",
+            reply_markup=kb_accounts(accounts),
+        )
+        return S_ACCOUNTS
+    if t == "▶️ Запустить":
         spheres = db_get_spheres()
         if not spheres:
-            await update.message.reply_text("Нет сфер. Создайте сначала.", reply_markup=kb_story_main())
-            return STATE_STORY_MENU
-        btns = [[KeyboardButton(s.name)] for s in spheres] + [[KeyboardButton("🔙 Назад")]]
-        await update.message.reply_text("Выберите сферу:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
-        return STATE_STORY_CHOOSE_SPHERE
-
-    if text == "🛠 Потоки":
-        sid = context.user_data.get("story_sphere_id")
+            await update.message.reply_text("Нет сфер.", reply_markup=kb_story()); return S_STORY
+        btns = [[s.name] for s in spheres] + [["🔙 Назад"]]
+        await update.message.reply_text("Выберите сферу:", reply_markup=kb(btns))
+        return S_RUN_SPHERE
+    if t == "🛠 Потоки":
+        sid = context.user_data.get("story_sid")
         if not sid:
             spheres = db_get_spheres()
             if not spheres:
-                await update.message.reply_text("Нет сфер.", reply_markup=kb_story_main())
-                return STATE_STORY_MENU
-            btns = [[KeyboardButton(s.name)] for s in spheres] + [[KeyboardButton("🔙 Назад")]]
-            context.user_data["story_flows_mode"] = True
-            await update.message.reply_text("Выберите сферу:", reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
-            return STATE_STORY_CHOOSE_SPHERE
+                await update.message.reply_text("Нет сфер.", reply_markup=kb_story()); return S_STORY
+            btns = [[s.name] for s in spheres] + [["🔙 Назад"]]
+            context.user_data["flows_mode"] = True
+            await update.message.reply_text("Выберите сферу:", reply_markup=kb(btns))
+            return S_RUN_SPHERE
         flows = db_get_flows(sid)
         await update.message.reply_text("Потоки:", reply_markup=kb_flows(flows))
-        return STATE_FLOWS_MENU
-
-    return STATE_STORY_MENU
+        return S_FLOWS
+    return S_STORY
 
 # ===========================================================================
 # HANDLERS — 👤 Аккаунты
 # ===========================================================================
 
-async def h_accounts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-
-    if text == "🔙 Назад":
-        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
-
-    if text == "➕ Добавить аккаунт":
+async def h_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🔙 Назад":
+        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story()); return S_STORY
+    if t == "➕ Добавить аккаунт":
         await update.message.reply_text(
-            "Введите номер телефона в формате +7XXXXXXXXXX:",
+            "Шаг 1 из 2\n\n"
+            "Вставьте стринг ссылку Telethon🤖\n\n"
+            "Используется для: публикации историй, отметок\n\n"
+            "Получить: запустите get_session_telethon.py",
             reply_markup=ReplyKeyboardRemove(),
         )
-        return STATE_ADD_ACC_PHONE
+        return S_ACC_TELETHON
 
-    # Нажали на карточку аккаунта — ищем [id:N]
-    aid = _extract_id(text)
+    aid = _extract_id(t)
     if aid:
         acc = db_get_account(aid)
         if acc:
             total, active = db_get_account_flow_count(acc.id)
             load          = db_get_account_load_pct(acc.id)
             load_label    = "🔴 Высокий" if load > 70 else ("🟡 Умеренный" if load > 40 else "🟢 Низкий")
-            last_story    = acc.last_story_at.strftime("%d.%m %H:%M") if acc.last_story_at else "—"
+            last_story    = _minutes_ago(acc.last_story_at)
+            premium_str   = "⭐️ Premium" if getattr(acc, "is_premium", False) else "Обычный"
             warnings      = []
-            if load > 70:   warnings.append("• Высокая нагрузка")
-            if (acc.stories_today or 0) > 40: warnings.append("• Много сторис за день")
+            if load > 70:                    warnings.append("• Высокая частота публикаций")
+            if (acc.avg_interval or 0) < 5:  warnings.append("• Короткие интервалы")
+            if load > 80:                    warnings.append("• Возможный риск ограничения")
+            if not getattr(acc, "is_premium", False):
+                warnings.append("• Нет Premium — публикация историй недоступна")
+
+            flows_info = db_get_account_flows(acc.id)
+            heavy_flow = max(flows_info, key=lambda f: f["stories_sent"], default=None) if flows_info else None
 
             card = (
                 f"Аккаунт: @{acc.username or acc.phone}\n"
-                f"Статус: {'Активен 🟢' if acc.is_active else 'Неактивен 🔴'}\n\n"
+                f"Статус: {'Активен 🟢' if acc.is_active else 'Неактивен 🔴'}\n"
+                f"Тип: {premium_str}\n\n"
                 f"Задействован в потоках: {total}\n"
                 f"Активных потоков: {active}\n\n"
-                f"📊 Нагрузка: {load_label} ({load}%)\n\n"
-                f"⏱ Последняя сторис: {last_story}\n\n"
-                f"Статистика:\n"
-                f"  Сторис сегодня: {acc.stories_today or 0}\n"
-                f"  Сторис всего: {acc.stories_total or 0}\n"
-                f"  Отметок всего: {acc.tags_total or 0}\n"
+                f"📊 Уровень нагрузки: {load_label} ({load}%)\n\n"
+                f"⏱ Активность:\n"
+                f"Последняя сторис: {last_story}\n\n"
+                f"Статистика за сегодня:\n"
+                f"Сторис: {acc.stories_today or 0}\n"
+                f"Отметок: {acc.tags_total or 0}\n"
+                f"Средний интервал: {acc.avg_interval or '—'} мин\n"
             )
             if warnings:
                 card += "\n⚠️ Предупреждения:\n" + "\n".join(warnings)
+            if heavy_flow:
+                card += f"\n\n⚠️ Основная нагрузка: Поток #{heavy_flow['flow_id']}"
 
-            await update.message.reply_text(card, reply_markup=kb_accounts(db_get_accounts()))
-            return STATE_ACCOUNTS_MENU
+            btns = []
+            if flows_info:
+                btns.append([f"🛠 Потоки аккаунта [acc:{acc.id}]"])
+            btns.append(["🔙 Назад"])
+            await update.message.reply_text(card, reply_markup=kb(btns))
+            context.user_data["viewing_acc_id"] = acc.id
+            return S_ACCOUNTS
 
-    return STATE_ACCOUNTS_MENU
+    # Кнопка "🛠 Потоки аккаунта"
+    if "[acc:" in t:
+        m = re.search(r"\[acc:(\d+)\]", t)
+        if m:
+            acc_id = int(m.group(1))
+            acc    = db_get_account(acc_id)
+            flows  = db_get_account_flows(acc_id)
+            lines  = [f"Потоки аккаунта: @{acc.username or acc.phone}\n"]
+            active_count = sum(1 for f in flows if f["status"] == "running")
+            lines.append(f"Активных: {active_count} / Всего: {len(flows)}\n")
+            lines.append("—" * 30)
+            for f in flows:
+                s = "🟢" if f["status"] == "running" else ("⚪" if f["status"] == "done" else "🔴")
+                status_str = "Активен" if f["status"] == "running" else ("Завершён" if f["status"] == "done" else "Остановлен")
+                lines.append(f"{s} Поток #{f['flow_id']} ({status_str}) — {f['stories_sent']} сторис")
+            heavy = max(flows, key=lambda f: f["stories_sent"], default=None)
+            if heavy and heavy["status"] == "running":
+                lines.append(f"\n⚠️ Основная нагрузка идёт от Потока #{heavy['flow_id']}")
+            await update.message.reply_text("\n".join(lines), reply_markup=kb_accounts(db_get_accounts()))
+    return S_ACCOUNTS
 
-async def h_add_acc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    if not phone.startswith("+"):
-        await update.message.reply_text("Введите номер с +, например +79001234567:")
-        return STATE_ADD_ACC_PHONE
-    context.user_data["new_acc_phone"] = phone
-    await update.message.reply_text(f"📱 Отправляю код на {phone}...")
+async def _validate_telethon_session(session_str: str) -> tuple:
+    """Проверяет Telethon session. Возвращает (username, phone) или (None, None)."""
     try:
-        client = PyrogramClient(f"pyro_auth_{phone}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
-        await client.connect()
-        sent = await client.send_code(phone)
-        context.user_data["pyro_auth_client"] = client
-        context.user_data["pyro_phone_hash"]  = sent.phone_code_hash
-        await update.message.reply_text("Введите код из Telegram:", reply_markup=ReplyKeyboardRemove())
-        return STATE_ADD_ACC_CODE
+        clean = session_str.strip().replace("\n","").replace("\r","").replace(" ","")
+        tc    = TelegramClient(StringSession(clean), API_ID, API_HASH)
+        await tc.connect()
+        if not await tc.is_user_authorized():
+            await tc.disconnect()
+            return None, None
+        me       = await tc.get_me()
+        username = me.username or me.first_name or str(me.id)
+        phone    = str(getattr(me, "phone", None) or me.id)
+        await tc.disconnect()
+        logger.info("[ACC] Telethon OK: @%s", username)
+        return username, phone
     except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка: {exc}\n\nПопробуйте ещё раз.")
-        return STATE_ADD_ACC_PHONE
+        logger.info("[ACC] Telethon validation failed: %s", exc)
+        return None, None
 
-async def h_add_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code   = update.message.text.strip().replace(" ", "")
-    phone  = context.user_data.get("new_acc_phone")
-    client = context.user_data.get("pyro_auth_client")
-    if not client:
-        await update.message.reply_text("Ошибка. Начните заново.")
-        return STATE_ACCOUNTS_MENU
-    try:
-        await client.sign_in(phone, code)
-    except Exception as exc:
-        if "PASSWORD" in str(exc).upper():
-            await update.message.reply_text("Введите облачный пароль (2FA):", reply_markup=ReplyKeyboardRemove())
-            return STATE_ADD_ACC_PASS
-        await update.message.reply_text(f"❌ Ошибка: {exc}")
-        return STATE_ADD_ACC_PHONE
-    return await _finish_acc_auth(update, context, client, phone)
 
-async def h_add_acc_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip()
-    phone    = context.user_data.get("new_acc_phone")
-    client   = context.user_data.get("pyro_auth_client")
+async def _validate_pyrogram_session(session_str: str) -> tuple:
+    """Проверяет Pyrogram session. Возвращает (username, phone, is_premium) или (None, None, False)."""
     try:
-        await client.check_password(password)
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Неверный пароль: {exc}")
-        return STATE_ADD_ACC_PASS
-    return await _finish_acc_auth(update, context, client, phone)
-
-async def _finish_acc_auth(update: Update, context: ContextTypes.DEFAULT_TYPE, client, phone: str):
-    try:
-        session_string = await client.export_session_string()
-        me = await client.get_me()
-        username = me.username or me.first_name or phone
-        await client.disconnect()
-        context.user_data.pop("pyro_auth_client", None)
-        db_add_account(phone=phone, username=username, session_string=session_string)
-        accounts = db_get_accounts()
-        await update.message.reply_text(
-            f"✅ Аккаунт @{username} добавлен!",
-            reply_markup=kb_accounts(accounts),
+        clean  = session_str.strip().replace("\n","").replace("\r","").replace(" ","")
+        client = PyrogramClient(
+            name=f"val_{abs(hash(clean[:20])) % 999999}",
+            api_id=API_ID, api_hash=API_HASH,
+            session_string=clean, in_memory=True,
         )
+        await client.start()
+        me         = await client.get_me()
+        username   = me.username or me.first_name or str(me.id)
+        phone      = str(getattr(me, "phone_number", None) or me.id)
+        is_premium = getattr(me, "is_premium", False) or False
+        await client.stop()
+        logger.info("[ACC] Pyrogram OK: @%s premium=%s", username, is_premium)
+        return username, phone, is_premium
     except Exception as exc:
-        await update.message.reply_text(f"❌ Ошибка: {exc}", reply_markup=kb_story_main())
-    return STATE_ACCOUNTS_MENU
+        logger.info("[ACC] Pyrogram validation failed: %s", exc)
+        return None, None, False
 
-# ===========================================================================
+
+async def h_acc_telethon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: принимает Telethon session string."""
+    session_str = update.message.text.strip().replace("\n","").replace("\r","").replace(" ","")
+    if len(session_str) < 20:
+        await update.message.reply_text(
+            "❌ Слишком короткая строка. Вставьте Telethon session string целиком."
+        )
+        return S_ACC_TELETHON
+
+    await update.message.reply_text("⏳ Проверяю Telethon сессию...")
+    username, phone = await _validate_telethon_session(session_str)
+
+    if not username:
+        await update.message.reply_text(
+            "❌ Невалидная session string, проверьте и попробуйте снова\n\n"
+            "Убедитесь что:\n"
+            "• Строка скопирована полностью\n"
+            "• Это Telethon session (из get_session_telethon.py)\n"
+            "• Сессия не отозвана"
+        )
+        return S_ACC_TELETHON
+
+    context.user_data["new_acc_telethon"] = session_str
+    context.user_data["new_acc_phone"]    = phone
+    context.user_data["new_acc_username"] = username
+
+    await update.message.reply_text(
+        f"✅ Telethon сессия OK — @{username}\n\n"
+        f"Шаг 2 из 2\n\n"
+        f"Вставьте стринг ссылку Pyrogram🧙\n\n"
+        f"Используется для: парсинга групп, сбора пользователей\n\n"
+        f"Получить: запустите get_session_pyrogram.py",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return S_ACC_PYROGRAM
+
+
+async def h_acc_pyrogram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: принимает Pyrogram session string, валидирует обе и сохраняет аккаунт."""
+    session_str = update.message.text.strip().replace("\n","").replace("\r","").replace(" ","")
+    if len(session_str) < 20:
+        await update.message.reply_text(
+            "❌ Слишком короткая строка. Вставьте Pyrogram session string целиком."
+        )
+        return S_ACC_PYROGRAM
+
+    await update.message.reply_text("⏳ Проверяю Pyrogram сессию...")
+    username_pyro, phone_pyro, is_premium = await _validate_pyrogram_session(session_str)
+
+    if not username_pyro:
+        await update.message.reply_text(
+            "❌ Невалидная session string, проверьте и попробуйте снова\n\n"
+            "Убедитесь что:\n"
+            "• Строка скопирована полностью\n"
+            "• Это Pyrogram session (из get_session_pyrogram.py)\n"
+            "• Сессия не отозвана"
+        )
+        return S_ACC_PYROGRAM
+
+    telethon_session = context.user_data.get("new_acc_telethon", "")
+    phone            = context.user_data.get("new_acc_phone", phone_pyro)
+    username         = context.user_data.get("new_acc_username", username_pyro)
+
+    db_add_account(
+        phone=phone,
+        username=username,
+        telethon_session=telethon_session,
+        pyrogram_session=session_str,
+        is_premium=is_premium,
+    )
+
+    for k in ("new_acc_telethon","new_acc_phone","new_acc_username"):
+        context.user_data.pop(k, None)
+
+    premium_tag = " ⭐️" if is_premium else ""
+    await update.message.reply_text(
+        f"Аккаунт добавлен✅\n@{username}{premium_tag}\n\n"
+        f"Telethon: ✅ (сторис)\n"
+        f"Pyrogram: ✅ (парсинг)",
+        reply_markup=kb_accounts(db_get_accounts()),
+    )
+    return S_ACCOUNTS
+
+
+# Заглушки для совместимости FSM
+async def h_acc_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await h_acc_telethon(update, context)
+
+async def h_acc_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Вставьте Telethon session string:", reply_markup=ReplyKeyboardRemove())
+    return S_ACC_TELETHON
+
+async def h_acc_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Вставьте Telethon session string:", reply_markup=ReplyKeyboardRemove())
+    return S_ACC_TELETHON
+
+async def _finish_acc(update, context, client, phone: str):
+    return S_ACCOUNTS
+
 # HANDLERS — Запуск потока
 # ===========================================================================
 
-async def h_story_choose_sphere(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🔙 Назад":
-        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
-    sphere = db_get_sphere_by_name(text)
+async def h_run_sphere(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🔙 Назад":
+        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story()); return S_STORY
+    sphere = db_get_sphere_by_name(t)
     if not sphere:
-        await update.message.reply_text("Сфера не найдена."); return STATE_STORY_CHOOSE_SPHERE
-    context.user_data["story_sphere_id"] = sphere.id
-    if context.user_data.pop("story_flows_mode", False):
+        await update.message.reply_text("Сфера не найдена."); return S_RUN_SPHERE
+    context.user_data["story_sid"] = sphere.id
+    if context.user_data.pop("flows_mode", False):
         flows = db_get_flows(sphere.id)
-        await update.message.reply_text("Потоки:", reply_markup=kb_flows(flows))
-        return STATE_FLOWS_MENU
+        await update.message.reply_text("Потоки:", reply_markup=kb_flows(flows)); return S_FLOWS
     templates = db_get_templates(sphere.id)
     await update.message.reply_text(
-        f"Сфера: {sphere.name}\nПользователей: {db_count_users(sphere.id)}\n\nВыберите шаблон:",
+        f"Сфера: {sphere.name}\nПользователей в базе: {db_count_users(sphere.id)}\n\nВыберите шаблон:",
         reply_markup=kb_templates(templates),
     )
-    return STATE_STORY_TMPL_MENU
+    return S_RUN_TMPL
 
-async def h_story_tmpl_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🔙 Назад":
-        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
-    if text == "➕ Новый шаблон":
-        await update.message.reply_text("Введите название шаблона:", reply_markup=ReplyKeyboardRemove())
-        return STATE_STORY_NEW_TMPL_NAME
-    name = text.replace("📋 ", "")
-    sid  = context.user_data.get("story_sphere_id")
+async def h_run_tmpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🔙 Назад":
+        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story()); return S_STORY
+    if t == "➕ Новый шаблон":
+        await update.message.reply_text("Введите название шаблона:", reply_markup=ReplyKeyboardRemove()); return S_NEW_TMPL
+    name = t.replace("📋 ", "")
+    sid  = context.user_data.get("story_sid")
     tmpl = next((t for t in db_get_templates(sid) if t.name == name), None)
     if not tmpl:
-        await update.message.reply_text("Шаблон не найден."); return STATE_STORY_TMPL_MENU
-    context.user_data["story_template_id"] = tmpl.id
+        await update.message.reply_text("Шаблон не найден."); return S_RUN_TMPL
+    context.user_data["story_tid"] = tmpl.id
     await update.message.reply_text("Выберите режим:", reply_markup=kb_modes(db_get_modes()))
-    return STATE_STORY_CHOOSE_MODE
+    return S_MODE
 
-async def h_story_new_tmpl_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def h_new_tmpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
-    if not name: await update.message.reply_text("Введите название:"); return STATE_STORY_NEW_TMPL_NAME
-    sid = context.user_data.get("story_sphere_id")
+    if not name: await update.message.reply_text("Введите название:"); return S_NEW_TMPL
+    sid = context.user_data.get("story_sid")
     tid = db_create_template(sid, name)
-    context.user_data["story_template_id"] = tid
+    context.user_data["story_tid"] = tid
     context.user_data["story_photos"] = []
     await update.message.reply_text(
-        "Отправьте фото (можно несколько). Когда закончите — напишите <b>готово</b>",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("готово")]], resize_keyboard=True),
+        "Отправьте фото (можно несколько). Когда закончите — «готово»",
+        reply_markup=kb([["готово"]]),
     )
-    return STATE_STORY_ADD_PHOTO
+    return S_PHOTO
 
-async def h_story_add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def h_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принимает фото, скачивает через Bot API и сохраняет локально.
+    Хранит путь к файлу вместо file_id — Telethon работает только с файлами.
+    """
     if update.message.text and update.message.text.lower() == "готово":
         photos = context.user_data.get("story_photos", [])
-        if not photos: await update.message.reply_text("Добавьте хотя бы одно фото!"); return STATE_STORY_ADD_PHOTO
-        db_update_template(context.user_data["story_template_id"], photo_ids=json.dumps(photos, ensure_ascii=False))
+        if not photos:
+            await update.message.reply_text("Добавьте хотя бы одно фото!")
+            return S_PHOTO
+        db_update_template(context.user_data["story_tid"], photo_ids=json.dumps(photos, ensure_ascii=False))
         await update.message.reply_text(
-            f"✅ Фото: {len(photos)} (сохранены на диск)\n\nВведите варианты подписи (каждый с новой строки):",
+            f"✅ Фото: {len(photos)}\n\nВведите варианты подписи (каждый с новой строки):",
             reply_markup=ReplyKeyboardRemove(),
         )
-        return STATE_STORY_ADD_TEXT
+        return S_TEXT
+
     if update.message.photo:
-        tid = context.user_data.get("story_template_id", "tmp")
-        idx = len(context.user_data.get("story_photos", []))
-        path = f"media/photos/{tid}_{idx}.jpg"
-        # Скачиваем файл через Bot API на диск
-        tg_file = await update.message.photo[-1].get_file()
+        tid   = context.user_data.get("story_tid", "tmp")
+        idx   = len(context.user_data.get("story_photos", []))
+        path  = f"media/photos/{tid}_{idx}.jpg"
+
+        # Скачиваем через Bot API прямо в файл
+        photo_obj = update.message.photo[-1]
+        tg_file   = await photo_obj.get_file()
         await tg_file.download_to_drive(path)
+
         context.user_data.setdefault("story_photos", []).append(path)
-        await update.message.reply_text(f"📷 Фото {len(context.user_data['story_photos'])} сохранено. Ещё или «готово».")
-        return STATE_STORY_ADD_PHOTO
-    await update.message.reply_text("Отправьте фото или «готово».")
-    return STATE_STORY_ADD_PHOTO
+        cnt = len(context.user_data["story_photos"])
+        await update.message.reply_text(f"📷 Фото {cnt} добавлено. Ещё или «готово».")
+        return S_PHOTO
 
-async def h_story_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отправьте фото.")
+    return S_PHOTO
+
+async def h_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texts = [t.strip() for t in update.message.text.strip().splitlines() if t.strip()]
-    if not texts: await update.message.reply_text("Введите хотя бы один текст:"); return STATE_STORY_ADD_TEXT
-    db_update_template(context.user_data["story_template_id"], texts=json.dumps(texts, ensure_ascii=False))
+    if not texts: await update.message.reply_text("Введите хотя бы один текст:"); return S_TEXT
+    db_update_template(context.user_data["story_tid"], texts=json.dumps(texts, ensure_ascii=False))
     await update.message.reply_text(
-        f"✅ Текстов: {len(texts)}\n\nТекст кнопки (или «пропустить»):",
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("пропустить")]], resize_keyboard=True),
+        f"✅ Текстов: {len(texts)}\n\n"
+        f"Введите текст кнопки (то что видит пользователь)\n"
+        f"Пример: ЖМИ\n\n"
+        f"Или «пропустить» если кнопка не нужна:",
+        reply_markup=kb([["пропустить"]]),
     )
-    return STATE_STORY_BTN_TEXT
+    return S_BTN_TEXT
 
-async def h_story_btn_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == "пропустить":
+async def h_btn_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: текст кнопки (для отображения в превью)."""
+    t = update.message.text.strip()
+    if t.lower() == "пропустить":
         await update.message.reply_text("Выберите режим:", reply_markup=kb_modes(db_get_modes()))
-        return STATE_STORY_CHOOSE_MODE
-    context.user_data["story_button_text"] = text
-    await update.message.reply_text("Введите ваш username (без @):", reply_markup=ReplyKeyboardRemove())
-    return STATE_STORY_BTN_MSG
+        return S_MODE
+    context.user_data["story_btn_text"] = t
+    await update.message.reply_text(
+        f"Текст кнопки: «{t}»\n\n"
+        f"Теперь введите текст который подставится в ЛС когда пользователь нажмёт кнопку\n\n"
+        f"Пример: Привет, хочу записаться!",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return S_BTN_MSG
 
-async def h_story_btn_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.text.strip().lstrip("@")
-    url = f"https://t.me/{username}"
-    db_update_template(context.user_data["story_template_id"], button_text=context.user_data.get("story_button_text", ""), button_url=url)
-    await update.message.reply_text(f"Ссылка: {url}\n\nПоложение кнопки:", reply_markup=kb_btn_pos())
-    return STATE_STORY_BTN_POS
+async def h_btn_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Шаг 2 создания кнопки: текст подставляемый в ЛС.
+    Автоматически получает username аккаунта через Telethon
+    и формирует ссылку — пользователь не вводит username вручную.
+    """
+    msg_text = update.message.text.strip()
+    context.user_data["story_btn_msg_text"] = msg_text
 
-async def h_story_btn_pos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pos_map = {"⬆️ Вверху": "top", "⏺ По центру": "center", "⬇️ Внизу": "bottom"}
-    db_update_template(context.user_data["story_template_id"], button_pos=pos_map.get(update.message.text, "bottom"))
+    # Получаем username через Telethon из первого активного аккаунта
+    username    = None
+    accounts    = db_get_accounts()
+    active_accs = [a for a in accounts if a.is_active]
+
+    await update.message.reply_text("⏳ Получаю username аккаунта...")
+
+    for acc in active_accs:
+        tc_session = getattr(acc, "telethon_session", None)
+        if not tc_session:
+            continue
+        try:
+            tc = TelegramClient(StringSession(tc_session), API_ID, API_HASH)
+            await tc.connect()
+            if await tc.is_user_authorized():
+                me       = await tc.get_me()
+                username = me.username
+                await tc.disconnect()
+                break
+            await tc.disconnect()
+        except Exception as exc:
+            logger.warning("[BTN] Telethon get_me failed: %s", exc)
+
+    if not username:
+        await update.message.reply_text(
+            "❌ У аккаунта нет username. Установите username в настройках Telegram\n\n"
+            "Без username невозможно создать ссылку на ЛС.",
+            reply_markup=kb_modes(db_get_modes()),
+        )
+        return S_MODE
+
+    # Формируем URL с encoding
+    encoded_text = urllib.parse.quote(msg_text, safe="")
+    button_url   = f"https://t.me/{username}?text={encoded_text}"
+
+    logger.info("[BTN] Generated URL: %s", button_url)
+
+    # Сохраняем в шаблон
+    db_update_template(
+        context.user_data["story_tid"],
+        button_text=context.user_data.get("story_btn_text", ""),
+        button_message_text=msg_text,
+        button_url=button_url,
+    )
+
+    await update.message.reply_text(
+        f"✅ Кнопка настроена!\n\n"
+        f"👤 Аккаунт: @{username}\n"
+        f"💬 Текст в ЛС: {msg_text}\n"
+        f"🔗 Ссылка: {button_url}\n\n"
+        f"Положение кнопки:",
+        reply_markup=kb_btn_pos(),
+    )
+    return S_BTN_POS
+
+async def h_btn_pos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pos = {"⬆️ Вверху": "top", "⏺ По центру": "center", "⬇️ Внизу": "bottom"}.get(update.message.text, "bottom")
+    db_update_template(context.user_data["story_tid"], button_pos=pos)
     await update.message.reply_text("✅ Шаблон сохранён!\n\nВыберите режим:", reply_markup=kb_modes(db_get_modes()))
-    return STATE_STORY_CHOOSE_MODE
+    return S_MODE
 
-async def h_story_choose_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🔙 Назад":
-        sid = context.user_data.get("story_sphere_id")
-        await update.message.reply_text("Выберите шаблон:", reply_markup=kb_templates(db_get_templates(sid)))
-        return STATE_STORY_TMPL_MENU
-    mode = next((m for m in db_get_modes() if m.name == text), None)
+async def h_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🔙 Назад":
+        sid = context.user_data.get("story_sid")
+        await update.message.reply_text("Шаблон:", reply_markup=kb_templates(db_get_templates(sid))); return S_RUN_TMPL
+    mode = next((m for m in db_get_modes() if m.name == t), None)
     if not mode:
-        await update.message.reply_text("Выберите из списка:", reply_markup=kb_modes(db_get_modes()))
-        return STATE_STORY_CHOOSE_MODE
-    context.user_data["story_mode_id"] = mode.id
+        await update.message.reply_text("Выберите из списка:", reply_markup=kb_modes(db_get_modes())); return S_MODE
+    context.user_data["story_mid"] = mode.id
     await update.message.reply_text(
         f"Режим: {mode.name}\nОтметок: {mode.mentions_min}–{mode.mentions_max}\n"
         f"Интервал: {mode.interval_min}–{mode.interval_max} мин\nЛимит/день: {mode.daily_limit}\n\n"
         f"Выберите время работы:", reply_markup=kb_time(),
     )
-    return STATE_STORY_CHOOSE_TIME
+    return S_TIME
 
-async def h_story_choose_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🔙 Назад":
-        await update.message.reply_text("Режим:", reply_markup=kb_modes(db_get_modes())); return STATE_STORY_CHOOSE_MODE
-    if text == "⏱ 20 минут":       end_time = datetime.utcnow() + timedelta(minutes=20)
-    elif text == "📅 1 день":       end_time = datetime.utcnow() + timedelta(days=1)
-    elif text == "♾ До отключения": end_time = None
-    elif text == "🗓 Своя дата":
-        await update.message.reply_text("Введите: ДД.ММ.ГГГГ ЧЧ:ММ", reply_markup=ReplyKeyboardRemove())
-        return STATE_STORY_CUSTOM_TIME
-    else: end_time = None
-    context.user_data["story_end_time"] = end_time
-    return await _show_select_accounts(update, context)
+async def h_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
+    if t == "🔙 Назад":
+        await update.message.reply_text("Режим:", reply_markup=kb_modes(db_get_modes())); return S_MODE
+    if t == "⏱ 20 минут":       end = datetime.utcnow() + timedelta(minutes=20)
+    elif t == "📅 1 день":       end = datetime.utcnow() + timedelta(days=1)
+    elif t == "♾ До отключения": end = None
+    elif t == "🗓 Своя дата":
+        await update.message.reply_text("Введите: ДД.ММ.ГГГГ ЧЧ:ММ", reply_markup=ReplyKeyboardRemove()); return S_CUSTOM_TIME
+    else: end = None
+    context.user_data["story_end"] = end
+    return await _show_select_accs(update, context)
 
-async def h_story_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: end_time = datetime.strptime(update.message.text.strip(), "%d.%m.%Y %H:%M")
+async def h_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: end = datetime.strptime(update.message.text.strip(), "%d.%m.%Y %H:%M")
     except ValueError:
-        await update.message.reply_text("Неверный формат. Пример: 25.12.2025 18:00"); return STATE_STORY_CUSTOM_TIME
-    context.user_data["story_end_time"] = end_time
-    return await _show_select_accounts(update, context)
+        await update.message.reply_text("Формат: 25.12.2025 18:00"); return S_CUSTOM_TIME
+    context.user_data["story_end"] = end
+    return await _show_select_accs(update, context)
 
-async def _show_select_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _show_select_accs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает экран выбора аккаунтов — НОВЫЙ ЭТАП после выбора времени."""
     accounts = db_get_accounts()
     if not accounts:
         await update.message.reply_text(
-            "⚠️ Нет аккаунтов! Добавьте через 👤 Аккаунты.",
-            reply_markup=kb_story_main(),
+            "⚠️ Нет аккаунтов!\n\nДобавьте через 👤 Аккаунты.",
+            reply_markup=kb_story(),
         )
-        return STATE_STORY_MENU
-    context.user_data["story_selected_acc_ids"] = []
+        return S_STORY
+    context.user_data["story_sel_ids"] = []
     await update.message.reply_text(
-        "Выберите аккаунты для потока\n(нажмите чтобы выбрать/снять, затем «➡️ Продолжить»):",
+        "Выберите аккаунт:\n\n🟢 — активен\n🔴 — перегружен / нежелательно использовать\n\n"
+        "Нажмите на аккаунт чтобы выбрать/снять:",
         reply_markup=kb_select_accs(accounts, []),
     )
-    return STATE_STORY_SELECT_ACCS
+    return S_SEL_ACCS
 
-async def h_story_select_accs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text     = update.message.text
+async def h_sel_accs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t        = update.message.text
     accounts = db_get_accounts()
-    selected = context.user_data.get("story_selected_acc_ids", [])
+    selected = context.user_data.get("story_sel_ids", [])
 
-    if text == "🔙 Назад":
-        await update.message.reply_text("Время работы:", reply_markup=kb_time())
-        return STATE_STORY_CHOOSE_TIME
+    if t == "🔙 Назад":
+        await update.message.reply_text("Время работы:", reply_markup=kb_time()); return S_TIME
 
-    if text == "➡️ Продолжить":
+    if t == "➡️ Продолжить":
         if not selected:
-            await update.message.reply_text("Выберите хотя бы один аккаунт!")
-            return STATE_STORY_SELECT_ACCS
-        # Сразу равномерное распределение
-        n   = len(selected)
-        pct = 100 // n; rem = 100 - pct * n
+            await update.message.reply_text("Выберите хотя бы один аккаунт!"); return S_SEL_ACCS
+        # Начальное распределение — равномерно
+        n   = len(selected); pct = 100 // n; rem = 100 - pct * n
         context.user_data["story_load"] = [(aid, pct + (1 if i < rem else 0)) for i, aid in enumerate(selected)]
         return await _show_load_screen(update, context)
 
-    # Нажали на аккаунт — toggle
-    aid = _extract_id(text)
+    aid = _extract_id(t)
     if aid:
         if aid in selected: selected.remove(aid)
         else: selected.append(aid)
-        context.user_data["story_selected_acc_ids"] = selected
+        context.user_data["story_sel_ids"] = selected
         await update.message.reply_text(
-            f"Выбрано: {len(selected)} аккаунт(ов)",
+            f"Выбрано аккаунтов: {len(selected)}",
             reply_markup=kb_select_accs(accounts, selected),
         )
-        return STATE_STORY_SELECT_ACCS
+        return S_SEL_ACCS
 
-    return STATE_STORY_SELECT_ACCS
+    return S_SEL_ACCS
 
 async def _show_load_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load = context.user_data.get("story_load", [])
-    lines = ["Распределение нагрузки:"]
-    for aid, pct in load:
-        a = db_get_account(aid)
-        if a: lines.append(f"@{a.username or a.phone} 🛠️{pct}%")
-    btns = []
-    if len(load) > 1: btns.append([KeyboardButton("🔧 Изменить нагрузку")])
-    btns.append([KeyboardButton("➡️ Продолжить"), KeyboardButton("🔙 Назад")])
-    await update.message.reply_text("\n".join(lines), reply_markup=ReplyKeyboardMarkup(btns, resize_keyboard=True))
-    return STATE_STORY_LOAD_DIST
+    await update.message.reply_text(_format_load(load), reply_markup=kb_load(load))
+    return S_LOAD_DIST
 
-async def h_story_load_dist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def h_load_dist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t    = update.message.text
     load = context.user_data.get("story_load", [])
 
-    if text == "🔙 Назад":
-        accounts = db_get_accounts()
-        selected = [aid for aid, _ in load]
-        await update.message.reply_text("Выберите аккаунты:", reply_markup=kb_select_accs(accounts, selected))
-        return STATE_STORY_SELECT_ACCS
+    if t == "🔙 Назад":
+        accounts = db_get_accounts(); selected = [aid for aid, _ in load]
+        await update.message.reply_text("Выберите аккаунт:", reply_markup=kb_select_accs(accounts, selected))
+        return S_SEL_ACCS
 
-    if text == "➡️ Продолжить":
-        return await _show_flow_preview(update, context)
+    if t == "➡️ Продолжить":
+        return await _show_preview(update, context)
 
-    if text == "🔧 Изменить нагрузку":
-        await update.message.reply_text("Режим перераспределения:", reply_markup=kb_load_dist())
-        return STATE_STORY_LOAD_DIST
+    if t == "🔧 Изменить нагрузку":
+        await update.message.reply_text(
+            f"{_format_load(load)}\n\nРежим перераспределения нагрузки:",
+            reply_markup=kb_load_dist(),
+        )
+        return S_LOAD_DIST
 
-    if text == "✋ Ручной":
-        context.user_data["load_manual_idx"] = 0
+    if t == "➕ Добавить аккаунт":
+        # Показываем аккаунты которые ещё не добавлены
+        already = [aid for aid, _ in load]
+        available = [a for a in db_get_accounts() if a.id not in already]
+        if not available:
+            await update.message.reply_text("Все аккаунты уже добавлены.")
+            return S_LOAD_DIST
+        btns = []
+        for acc in available:
+            l = db_get_account_load_pct(acc.id); s = "🔴" if l > 70 else "🟢"
+            btns.append([f"{s} @{acc.username or acc.phone} нагрузка {l}% [id:{acc.id}]"])
+        btns.append(["🔙 Назад"])
+        context.user_data["adding_to_load"] = True
+        await update.message.reply_text("Выберите аккаунт:", reply_markup=kb(btns))
+        return S_LOAD_DIST
+
+    if context.user_data.pop("adding_to_load", False):
+        aid = _extract_id(t)
+        if aid:
+            load.append((aid, 0))
+            # Пересчитываем равномерно
+            n = len(load); pct = 100 // n; rem = 100 - pct * n
+            load = [(a, pct + (1 if i < rem else 0)) for i, (a, _) in enumerate(load)]
+            context.user_data["story_load"] = load
+            return await _show_load_screen(update, context)
+
+    if t == "✋ Ручной":
+        context.user_data["load_idx"] = 0
         a = db_get_account(load[0][0])
-        await update.message.reply_text(f"% для @{a.username or a.phone} (0–100):", reply_markup=ReplyKeyboardRemove())
-        return STATE_STORY_LOAD_MANUAL
+        await update.message.reply_text(
+            f"Выберите % нагрузки для аккаунта @{a.username or a.phone}\nПример: 50",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return S_LOAD_MANUAL
 
-    if text == "⚖️ Равномерно":
+    if t == "⚖️ Равномерно":
         n = len(load); pct = 100 // n; rem = 100 - pct * n
         context.user_data["story_load"] = [(aid, pct + (1 if i < rem else 0)) for i, (aid, _) in enumerate(load)]
+        await update.message.reply_text("Данные изменены✅")
         return await _show_load_screen(update, context)
 
-    if text == "🧠 Умное распределение":
-        accs = [db_get_account(aid) for aid, _ in load]
+    if t == "🧠 Умное распределение":
+        accs   = [db_get_account(aid) for aid, _ in load]
         result = _smart_distribute([a for a in accs if a])
         context.user_data["story_load"] = result
+        # Показываем с пояснениями
+        lines = ["Распределение нагрузки:"]
+        for aid, pct in result:
+            a    = db_get_account(aid)
+            cur  = db_get_account_load_pct(aid)
+            risk = "🟢 Аккаунт можно нагружать" if cur < 50 else "🔴 Аккаунт перегружен"
+            if a: lines.append(f"@{a.username or a.phone} 🛠️{pct}%\n{risk}")
+        await update.message.reply_text("\n".join(lines), reply_markup=kb_load(result))
+        return S_LOAD_DIST
+
+    if t == "🔙 Назад":
         return await _show_load_screen(update, context)
 
-    return STATE_STORY_LOAD_DIST
+    return S_LOAD_DIST
 
-async def h_story_load_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def h_load_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         pct = int(update.message.text.strip())
         if not 0 <= pct <= 100: raise ValueError
     except ValueError:
-        await update.message.reply_text("Введите число от 0 до 100:"); return STATE_STORY_LOAD_MANUAL
+        await update.message.reply_text("Введите число от 0 до 100:"); return S_LOAD_MANUAL
     load = context.user_data.get("story_load", [])
-    idx  = context.user_data.get("load_manual_idx", 0)
+    idx  = context.user_data.get("load_idx", 0)
     if idx < len(load):
         aid = load[idx][0]; load[idx] = (aid, pct)
         context.user_data["story_load"] = load
-    idx += 1; context.user_data["load_manual_idx"] = idx
+    idx += 1; context.user_data["load_idx"] = idx
     if idx < len(load):
         a = db_get_account(load[idx][0])
-        await update.message.reply_text(f"% для @{a.username or a.phone}:")
-        return STATE_STORY_LOAD_MANUAL
+        await update.message.reply_text(f"% для @{a.username or a.phone}:"); return S_LOAD_MANUAL
     total = sum(p for _, p in load)
     if total != 100:
-        await update.message.reply_text(f"⚠️ Сумма = {total}%, нужно 100%. Введите заново.")
-        context.user_data["load_manual_idx"] = 0
+        await update.message.reply_text(f"⚠️ Сумма = {total}%, нужно 100%. Начнём заново.")
+        context.user_data["load_idx"] = 0
         a = db_get_account(load[0][0])
-        await update.message.reply_text(f"% для @{a.username or a.phone}:")
-        return STATE_STORY_LOAD_MANUAL
-    await update.message.reply_text("Данные изменены ✅")
+        await update.message.reply_text(f"% для @{a.username or a.phone}:"); return S_LOAD_MANUAL
+    await update.message.reply_text("Данные изменены✅")
     return await _show_load_screen(update, context)
 
-async def _show_flow_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sid      = context.user_data.get("story_sphere_id")
-    tid      = context.user_data.get("story_template_id")
-    mid      = context.user_data.get("story_mode_id")
-    end_time = context.user_data.get("story_end_time")
-    load     = context.user_data.get("story_load", [])
-    tmpl     = db_get_template(tid)
-    mode     = db_get_mode(mid)
-    photos   = json.loads(tmpl.photo_ids or "[]")
-    texts    = json.loads(tmpl.texts     or "[]")
-    time_str = end_time.strftime("%d.%m.%Y %H:%M") if end_time else "до отключения"
+async def _show_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sid  = context.user_data.get("story_sid")
+    tid  = context.user_data.get("story_tid")
+    mid  = context.user_data.get("story_mid")
+    end  = context.user_data.get("story_end")
+    load = context.user_data.get("story_load", [])
+    tmpl = db_get_template(tid); mode = db_get_mode(mid)
+    photos = json.loads(tmpl.photo_ids or "[]"); texts = json.loads(tmpl.texts or "[]")
+    time_str = end.strftime("%d.%m.%Y %H:%M") if end else "до отключения"
     acc_lines = []
     for aid, pct in load:
         a = db_get_account(aid)
         if a: acc_lines.append(f"@{a.username or a.phone} 🛠️{pct}%")
+
     preview = (
+        f"Предпросмотр🔒\n\n"
         f"📋 Шаблон: {tmpl.name}\n"
         f"📷 Фото: {len(photos)} шт. | 💬 Текстов: {len(texts)}\n"
-        f"🔗 Кнопка: {tmpl.button_url or 'нет'}\n\n"
-        f"⚙️ Режим: {mode.name}\n"
+        f"🔗 Кнопка: {tmpl.button_text or 'нет'}\n"
+        f"💬 Текст в ЛС: {getattr(tmpl, 'button_message_text', None) or 'нет'}\n"
+        f"📍 Позиция: {tmpl.button_pos}\n\n"
+        f"{'—'*30}\n\n"
+        f"Кнопка\n{tmpl.button_url or '—'}\n\n"
+        f"{'—'*30}\n\n"
+        f"Режим\n{mode.name}\n"
         f"⏱ Время: {time_str}\n"
         f"👥 Пользователей: {db_count_users(sid)}\n\n"
-        f"{'—'*30}\n"
-        f"Аккаунты:\n" + "\n".join(acc_lines) + "\n\n"
+        f"{'—'*30}\n\n"
+        f"Выбранные аккаунты:\n" + "\n".join(acc_lines) + "\n\n"
         f"Запустить поток?"
     )
     await update.message.reply_text(preview, reply_markup=kb_confirm())
-    return STATE_FLOWS_MENU
+    return S_FLOWS
 
 # ===========================================================================
 # HANDLERS — Потоки
 # ===========================================================================
 
-async def h_flows_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def h_flows(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text
 
-    if text == "✅ Запустить":
-        sid      = context.user_data.get("story_sphere_id")
-        tid      = context.user_data.get("story_template_id")
-        mid      = context.user_data.get("story_mode_id")
-        end_time = context.user_data.get("story_end_time")
-        load     = context.user_data.get("story_load", [])
+    if t == "✅ Запустить":
+        sid  = context.user_data.get("story_sid")
+        tid  = context.user_data.get("story_tid")
+        mid  = context.user_data.get("story_mid")
+        end  = context.user_data.get("story_end")
+        load = context.user_data.get("story_load", [])
         if not load:
-            await update.message.reply_text("Нет аккаунтов!", reply_markup=kb_story_main())
-            return STATE_STORY_MENU
-        fid  = db_create_flow(sid, tid, mid, end_time)
+            await update.message.reply_text("Нет аккаунтов!", reply_markup=kb_story()); return S_STORY
+        fid = db_create_flow(sid, tid, mid, end)
         for aid, pct in load: db_add_flow_account(fid, aid, pct)
         task = asyncio.create_task(_run_flow(fid))
         _active_flows[fid] = task
-        acc_list = ", ".join(f"@{db_get_account(aid).username or db_get_account(aid).phone}" for aid, _ in load if db_get_account(aid))
-        await update.message.reply_text(f"🚀 Поток #{fid} запущен!\nАккаунты: {acc_list}", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
+        acc_str = ", ".join(f"@{db_get_account(aid).username or db_get_account(aid).phone}" for aid, _ in load if db_get_account(aid))
+        await update.message.reply_text(f"🚀 Поток #{fid} запущен!\nАккаунты: {acc_str}", reply_markup=kb_story())
+        return S_STORY
 
-    if text == "❌ Отмена":
-        await update.message.reply_text("Отменено.", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
+    if t == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=kb_story()); return S_STORY
+    if t == "🔙 Назад":
+        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story()); return S_STORY
 
-    if text == "🔙 Назад":
-        await update.message.reply_text("📸 Отметки сторис:", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
-
-    # Нажали на поток — ищем [id:N]
-    fid = _extract_id(text)
+    fid = _extract_id(t)
     if fid:
         flow = db_get_flow(fid)
         if flow:
-            context.user_data["story_flow_detail_id"] = fid
-            fas       = db_get_flow_accounts(fid)
+            context.user_data["flow_detail_id"] = fid
+            fas = db_get_flow_accounts(fid)
             acc_lines = []
             for fa in fas:
                 a = db_get_account(fa.account_id)
                 if a: acc_lines.append(f"@{a.username or a.phone} 🛠️{fa.load_pct}%")
-            mins = int((datetime.utcnow() - flow.created_at).total_seconds() / 60)
-            h, m = divmod(mins, 60); d, h = divmod(h, 24)
             detail = (
-                f"Поток #{flow.id} {'🟢 Активен' if flow.status == 'running' else '🔴 Остановлен'}\n\n"
-                f"📷 Сторис: {flow.stories_sent}\n"
-                f"🧍 Отмечено: {flow.users_tagged}\n"
-                f"⏱ Время: {d}д {h}ч {m}м\n"
-                f"Аккаунтов: {len(fas)}\n\n"
-                f"Распределение:\n" + "\n".join(acc_lines)
+                f"Поток #{flow.id} {'Активен🟢' if flow.status == 'running' else '🔴'}\n\n"
+                f"📷 Опубликованных сторис: {flow.stories_sent}\n"
+                f"🧍 Кол-во отмеченных клиентов: {flow.users_tagged}\n"
+                f"⏱ Общее время работы: {_work_duration(flow.created_at)}\n"
+                f"👀 Просмотры: —\n"
+                f"🏆 Успешные клиенты: —\n\n"
+                f"Аккаунты в действии потока: {len(fas)}\n" + "\n".join(acc_lines)
             )
             await update.message.reply_text(detail, reply_markup=kb_flow_detail())
-            return STATE_FLOW_DETAIL
+            return S_FLOW_DETAIL
 
-    sid = context.user_data.get("story_sphere_id")
+    sid = context.user_data.get("story_sid")
     if sid:
-        await update.message.reply_text("Потоки:", reply_markup=kb_flows(db_get_flows(sid)))
-    return STATE_FLOWS_MENU
+        flows = db_get_flows(sid)
+        await update.message.reply_text("Потоки:", reply_markup=kb_flows(flows))
+    return S_FLOWS
 
 async def h_flow_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    fid  = context.user_data.get("story_flow_detail_id")
+    t   = update.message.text
+    fid = context.user_data.get("flow_detail_id")
     flow = db_get_flow(fid) if fid else None
 
-    if text == "🔙 Назад":
-        sid = context.user_data.get("story_sphere_id")
+    if t == "🔙 Назад":
+        sid = context.user_data.get("story_sid")
         flows = db_get_flows(sid) if sid else []
-        await update.message.reply_text("Потоки:", reply_markup=kb_flows(flows))
-        return STATE_FLOWS_MENU
+        await update.message.reply_text("Потоки:", reply_markup=kb_flows(flows)); return S_FLOWS
 
-    if text == "🛑 СТОП" and flow:
+    if t == "🛑 СТОП" and flow:
         db_stop_flow(fid)
         if fid in _active_flows: _active_flows[fid].cancel(); _active_flows.pop(fid, None)
-        await update.message.reply_text(f"🔴 Поток #{fid} остановлен.", reply_markup=kb_story_main())
-        return STATE_STORY_MENU
+        await update.message.reply_text(f"🔴 Поток #{fid} остановлен.", reply_markup=kb_story()); return S_STORY
 
-    if text == "📊 Нагрузка аккаунтов" and flow:
+    if t == "📊 Нагрузка аккаунтов" and flow:
         fas   = db_get_flow_accounts(fid)
         lines = ["Распределение нагрузки:"]
         for fa in fas:
             a = db_get_account(fa.account_id)
             if a:
-                load = db_get_account_load_pct(a.id)
-                risk = "🔴" if load > 70 else ("🟡" if load > 40 else "🟢")
-                lines.append(f"@{a.username or a.phone} 🛠️{fa.load_pct}% {risk}")
-        await update.message.reply_text("\n".join(lines), reply_markup=kb_flow_detail())
-        return STATE_FLOW_DETAIL
+                l = db_get_account_load_pct(a.id); r = "🔴" if l > 70 else ("🟡" if l > 40 else "🟢")
+                lines.append(f"@{a.username or a.phone} 🛠️{fa.load_pct}% {r}")
+        await update.message.reply_text("\n".join(lines), reply_markup=kb([ ["🔙 Назад"] ]))
+        return S_FLOW_DETAIL
 
-    if text == "📋 Логи работы" and flow:
+    if t == "📋 Логи работы" and flow:
         logs = json.loads(flow.logs or "[]")
-        log_text = "\n".join(logs[-20:]) if logs else "Логов нет."
-        await update.message.reply_text(f"Логи #{fid}:\n\n{log_text}", reply_markup=kb_flow_detail())
-        return STATE_FLOW_DETAIL
+        await update.message.reply_text(
+            f"Логи работы🚧 #{fid}:\n\n" + ("\n".join(logs[-20:]) if logs else "Логов нет."),
+            reply_markup=kb([["🔙 Назад"]]),
+        )
+        return S_FLOW_DETAIL
 
-    return STATE_FLOW_DETAIL
+    if t == "Подробнее" and flow:
+        fas   = db_get_flow_accounts(fid)
+        tmpl  = db_get_template(flow.template_id)
+        acc_lines = []
+        for fa in fas:
+            a = db_get_account(fa.account_id)
+            if a: acc_lines.append(f"@{a.username or a.phone} 🛠️{fa.load_pct}%")
+        texts = json.loads(tmpl.texts or "[]") if tmpl else []
+        detail = (
+            f"Предпросмотр🔒\n\n"
+            f"{chr(10).join(texts[:2]) if texts else '—'}\n\n"
+            f"{'—'*30}\n\n"
+            f"Кнопка\n{tmpl.button_url if tmpl else '—'}\n\n"
+            f"{'—'*30}\n\n"
+            f"Режим\n{db_get_mode(flow.mode_id).name if db_get_mode(flow.mode_id) else '—'}\n\n"
+            f"{'—'*30}\n\n"
+            f"Выбранные аккаунты:\n" + "\n".join(acc_lines)
+        )
+        await update.message.reply_text(detail, reply_markup=kb([["Полный просмотр", "🔙 Назад"]]))
+        return S_FLOW_DETAIL
+
+    return S_FLOW_DETAIL
 
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используйте кнопки меню.", reply_markup=kb_main())
-    return STATE_MAIN_MENU
+    return S_MAIN
 
 # ===========================================================================
 # MAIN
@@ -1961,44 +2613,48 @@ def main() -> None:
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
-            STATE_MAIN_MENU:           [MessageHandler(filters.TEXT & ~filters.COMMAND, h_main_menu)],
-            STATE_SPHERE_MENU:         [MessageHandler(filters.TEXT & ~filters.COMMAND, h_sphere_menu)],
-            STATE_ADD_SPHERE_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_sphere_name)],
-            STATE_AFTER_STAGE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, h_after_stage)],
-            STATE_ADD_STAGE_DESC:      [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_stage_desc)],
-            STATE_ADD_STAGE_SCRIPT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_stage_script)],
-            STATE_ADD_GROUP_KEYWORDS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_group_keywords)],
-            STATE_ADD_USER_KEYWORDS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_user_keywords)],
-            STATE_ADD_GROUP_LINKS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_group_links)],
-            STATE_SHOW_CLIENT:         [MessageHandler(filters.TEXT & ~filters.COMMAND, h_show_client)],
-            STATE_EDIT_SCRIPT_CHOOSE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_script_choose)],
-            STATE_EDIT_SCRIPT_DESC:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_script_desc)],
-            STATE_EDIT_SCRIPT_TEXT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_script_text)],
-            STATE_EDIT_KEYS_GROUP:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_keys_group)],
-            STATE_EDIT_KEYS_USER:      [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_keys_user)],
-            STATE_REDO_STAGE_DESC:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_redo_stage_desc)],
-            STATE_REDO_STAGE_SCRIPT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_redo_stage_script)],
-            STATE_STORY_MENU:          [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_menu)],
-            STATE_ACCOUNTS_MENU:       [MessageHandler(filters.TEXT & ~filters.COMMAND, h_accounts_menu)],
-            STATE_ADD_ACC_PHONE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_acc_phone)],
-            STATE_ADD_ACC_CODE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_acc_code)],
-            STATE_ADD_ACC_PASS:        [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_acc_pass)],
-            STATE_STORY_CHOOSE_SPHERE: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_choose_sphere)],
-            STATE_STORY_TMPL_MENU:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_tmpl_menu)],
-            STATE_STORY_NEW_TMPL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_new_tmpl_name)],
-            STATE_STORY_ADD_PHOTO:     [MessageHandler(filters.PHOTO | filters.TEXT,    h_story_add_photo)],
-            STATE_STORY_ADD_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_add_text)],
-            STATE_STORY_BTN_TEXT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_btn_text)],
-            STATE_STORY_BTN_MSG:       [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_btn_msg)],
-            STATE_STORY_BTN_POS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_btn_pos)],
-            STATE_STORY_CHOOSE_MODE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_choose_mode)],
-            STATE_STORY_CHOOSE_TIME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_choose_time)],
-            STATE_STORY_CUSTOM_TIME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_custom_time)],
-            STATE_STORY_SELECT_ACCS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_select_accs)],
-            STATE_STORY_LOAD_DIST:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_load_dist)],
-            STATE_STORY_LOAD_MANUAL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story_load_manual)],
-            STATE_FLOWS_MENU:          [MessageHandler(filters.TEXT & ~filters.COMMAND, h_flows_menu)],
-            STATE_FLOW_DETAIL:         [MessageHandler(filters.TEXT & ~filters.COMMAND, h_flow_detail)],
+            S_MAIN:        [MessageHandler(filters.TEXT & ~filters.COMMAND, h_main)],
+            S_SPHERE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, h_sphere)],
+            S_ADD_SPHERE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_sphere)],
+            S_AFTER_STAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_after_stage)],
+            S_STAGE_DESC:  [MessageHandler(filters.TEXT & ~filters.COMMAND, h_stage_desc)],
+            S_STAGE_SCRIPT:[MessageHandler(filters.TEXT & ~filters.COMMAND, h_stage_script)],
+            S_ADD_GRP_LINKS:[MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_grp_links)],
+            S_ADD_USR_KWS: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_usr_kws)],
+            S_SHOW_CLIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_show_client)],
+            S_EDIT_CHOOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_choose)],
+            S_EDIT_DESC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_desc)],
+            S_EDIT_TEXT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_text)],
+            S_EDIT_GRP:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_grp)],
+            S_EDIT_USR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_usr)],
+            S_EDIT_DATA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_edit_data)],
+            S_ADD_GRP_NOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_add_grp_now)],
+            S_CONFIRM_DEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_confirm_del)],
+            S_REDO_DESC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_redo_desc)],
+            S_REDO_SCRIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_redo_script)],
+            S_STORY:       [MessageHandler(filters.TEXT & ~filters.COMMAND, h_story)],
+            S_ACCOUNTS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_accounts)],
+            S_ACC_TELETHON:[MessageHandler(filters.TEXT & ~filters.COMMAND, h_acc_telethon)],
+            S_ACC_PYROGRAM:[MessageHandler(filters.TEXT & ~filters.COMMAND, h_acc_pyrogram)],
+            S_ACC_PHONE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_acc_phone)],
+            S_ACC_CODE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_acc_code)],
+            S_ACC_PASS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_acc_pass)],
+            S_RUN_SPHERE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, h_run_sphere)],
+            S_RUN_TMPL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_run_tmpl)],
+            S_NEW_TMPL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_new_tmpl)],
+            S_PHOTO:       [MessageHandler(filters.PHOTO | filters.TEXT,    h_photo)],
+            S_TEXT:        [MessageHandler(filters.TEXT & ~filters.COMMAND, h_text)],
+            S_BTN_TEXT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_btn_text)],
+            S_BTN_MSG:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_btn_msg)],
+            S_BTN_POS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, h_btn_pos)],
+            S_MODE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, h_mode)],
+            S_TIME:        [MessageHandler(filters.TEXT & ~filters.COMMAND, h_time)],
+            S_CUSTOM_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_custom_time)],
+            S_SEL_ACCS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, h_sel_accs)],
+            S_LOAD_DIST:   [MessageHandler(filters.TEXT & ~filters.COMMAND, h_load_dist)],
+            S_LOAD_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_load_manual)],
+            S_FLOWS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, h_flows)],
+            S_FLOW_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_flow_detail)],
         },
         fallbacks=[CommandHandler("start", cmd_start), MessageHandler(filters.ALL, fallback)],
         allow_reentry=True,
@@ -2007,6 +2663,7 @@ def main() -> None:
 
     async def on_startup(application):
         asyncio.create_task(background_worker())
+        # Восстанавливаем активные потоки после перезапуска
         for sphere in db_get_spheres():
             for flow in db_get_flows(sphere.id):
                 if flow.status == "running":
