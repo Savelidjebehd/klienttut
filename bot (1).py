@@ -27,6 +27,8 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
 import urllib.parse
+import io as _io
+from PIL import Image, ImageDraw, ImageFont
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -38,6 +40,7 @@ from telethon.tl.types import (
     InputPrivacyValueAllowAll,
     MediaAreaUrl,
     MediaAreaCoordinates,
+    MessageActionSetMessagesTTL,
 )
 
 from pyrogram import Client as PyrogramClient
@@ -1104,6 +1107,74 @@ async def _get_telethon_client(account: TgAccount) -> Optional[TelegramClient]:
         return None
 
 
+def _draw_button_on_photo(photo_path: str, button_text: str, position: str) -> str:
+    """
+    Рисует белую кнопку с голубым текстом поверх фото.
+    Возвращает путь к временному файлу с кнопкой.
+    Это нужно потому что MediaAreaUrl не поддерживает кастомный цвет кнопки —
+    Telegram всегда показывает её прозрачной.
+    """
+    try:
+        img = Image.open(photo_path).convert("RGBA")
+        w, h = img.size
+
+        draw = ImageDraw.Draw(img)
+
+        # Размеры кнопки — 60% ширины, 8% высоты
+        btn_w = int(w * 0.60)
+        btn_h = int(h * 0.085)
+        btn_r = int(btn_h * 0.35)  # скругление углов
+
+        # Позиция кнопки по вертикали
+        pos_map = {"top": 0.18, "center": 0.48, "bottom": 0.78}
+        y_center = pos_map.get(position or "bottom", 0.78)
+        btn_x = (w - btn_w) // 2
+        btn_y = int(h * y_center) - btn_h // 2
+
+        # Рисуем белую кнопку со скруглёнными углами
+        _draw_rounded_rect(draw, btn_x, btn_y, btn_w, btn_h, btn_r,
+                           fill=(255, 255, 255, 230))
+
+        # Голубой текст
+        text_color = (0, 136, 204, 255)  # Telegram blue
+        font_size  = max(18, btn_h // 2)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except Exception:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", font_size)
+            except Exception:
+                font = ImageFont.load_default()
+
+        # Центрируем текст
+        bbox = draw.textbbox((0, 0), button_text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        text_x = btn_x + (btn_w - text_w) // 2
+        text_y = btn_y + (btn_h - text_h) // 2
+
+        draw.text((text_x, text_y), button_text, font=font, fill=text_color)
+
+        # Сохраняем во временный файл
+        out_path = photo_path.replace(".jpg", "_btn.jpg").replace(".jpeg", "_btn.jpeg").replace(".png", "_btn.png")
+        img.convert("RGB").save(out_path, "JPEG", quality=92)
+        return out_path
+
+    except Exception as exc:
+        logger.warning("[BTN DRAW] Ошибка рисования кнопки: %s", exc)
+        return photo_path  # возвращаем оригинал если что-то пошло не так
+
+
+def _draw_rounded_rect(draw, x, y, w, h, r, fill):
+    """Рисует прямоугольник со скруглёнными углами."""
+    draw.rectangle([x + r, y, x + w - r, y + h], fill=fill)
+    draw.rectangle([x, y + r, x + w, y + h - r], fill=fill)
+    draw.ellipse([x, y, x + 2*r, y + 2*r], fill=fill)
+    draw.ellipse([x + w - 2*r, y, x + w, y + 2*r], fill=fill)
+    draw.ellipse([x, y + h - 2*r, x + 2*r, y + h], fill=fill)
+    draw.ellipse([x + w - 2*r, y + h - 2*r, x + w, y + h], fill=fill)
+
+
 def _build_button_url(account: TgAccount, template: StoryTemplate) -> Optional[str]:
     """
     Формирует URL кнопки в формате https://t.me/username?text=encoded_text
@@ -1122,6 +1193,91 @@ def _build_button_url(account: TgAccount, template: StoryTemplate) -> Optional[s
     url = f"https://t.me/{username}?text={encoded}"
     logger.info("[STORY] Button URL: %s", url)
     return url
+
+
+async def _set_ttl_for_user(tc: TelegramClient, username: str, account_name: str) -> bool:
+    """
+    Устанавливает TTL = 1 год в диалоге с пользователем.
+    Удаляет системное сообщение об этом.
+    Возвращает True если успешно, False если не удалось.
+    """
+    try:
+        await tc(tl_functions.messages.SetHistoryTTLRequest(
+            peer=username,
+            period=31536000,
+        ))
+
+        await asyncio.sleep(0.3)
+
+        # Удаляем системное сообщение
+        messages = await tc.get_messages(username, limit=5)
+        to_delete = [
+            msg.id for msg in messages
+            if msg.action and isinstance(msg.action, MessageActionSetMessagesTTL)
+        ]
+        if to_delete:
+            await tc.delete_messages(username, to_delete)
+
+        logger.info("[TTL] @%s → @%s: TTL установлен, сообщение удалено", account_name, username)
+        return True
+
+    except Exception as exc:
+        logger.warning("[TTL] @%s → @%s: ошибка — %s", account_name, username, exc)
+        return False
+
+
+async def _prepare_users_for_story(
+    tc: TelegramClient,
+    account: TgAccount,
+    users: list,
+) -> list:
+    """
+    Устанавливает TTL для каждого пользователя из списка отмечаемых.
+    Если у пользователя не удалось установить TTL — исключаем его из отметок
+    и берём следующего из базы (sphere_id берём из первого пользователя).
+
+    Возвращает финальный список пользователей у которых TTL установлен.
+    """
+    acc_name = account.username or account.phone
+    ok_users = []
+    failed   = []
+
+    for user in users:
+        if not user.username:
+            continue
+        success = await _set_ttl_for_user(tc, f"@{user.username}", acc_name)
+        if success:
+            ok_users.append(user)
+        else:
+            failed.append(user.username)
+            logger.info("[TTL] @%s: пропускаем @%s, берём замену", acc_name, user.username)
+
+    # Для каждого неудачного пользователя берём замену из базы
+    if failed and users:
+        sphere_id = users[0].sphere_id if hasattr(users[0], "sphere_id") else None
+        if sphere_id:
+            for _ in failed:
+                replacement = db_get_random_client(sphere_id)
+                if not replacement or not replacement.username:
+                    continue
+                if replacement.username in [u.username for u in ok_users]:
+                    continue
+                success = await _set_ttl_for_user(tc, f"@{replacement.username}", acc_name)
+                if success:
+                    # Конвертируем Client → UsersDB-like объект
+                    class _U:
+                        def __init__(self, c):
+                            self.username   = c.username
+                            self.user_id    = c.username
+                            self.sphere_id  = sphere_id
+                    ok_users.append(_U(replacement))
+                    logger.info("[TTL] @%s: замена @%s добавлена", acc_name, replacement.username)
+
+    logger.info(
+        "[TTL] @%s: итого %d/%d пользователей готовы",
+        acc_name, len(ok_users), len(users),
+    )
+    return ok_users
 
 
 async def _publish_story(account: TgAccount, template: StoryTemplate, users: list) -> bool:
@@ -1151,28 +1307,30 @@ async def _publish_story(account: TgAccount, template: StoryTemplate, users: lis
             mid      = len(mentions) // 2
             caption  = f"{caption}\n\n{' '.join(mentions[:mid])}\n{' '.join(mentions[mid:])}".strip()
 
-        # Локальный файл → Telethon upload_file
+        # Локальный файл → рисуем кнопку → Telethon upload_file
         photo_path = random.choice(photo_paths)
         if not os.path.exists(photo_path):
             logger.error("[STORY] @%s: файл не найден: %s", account.username or account.phone, photo_path)
-            await tc.disconnect()
             return False
 
-        logger.info("[STORY] @%s: загружаю %s", account.username or account.phone, photo_path)
-        uploaded = await tc.upload_file(photo_path)
-        media    = InputMediaUploadedPhoto(file=uploaded)
-
-        # Кнопка MediaAreaUrl (координаты 0–100)
-        media_areas = []
         button_url  = _build_button_url(account, template)
+        media_areas = []
+        upload_path = photo_path  # по умолчанию оригинал
+
         if button_url:
+            # Рисуем белую кнопку с голубым текстом прямо на фото
+            btn_text    = template.button_text or "Написать"
+            upload_path = _draw_button_on_photo(photo_path, btn_text, template.button_pos or "bottom")
+            logger.info("[STORY] @%s: кнопка нарисована на фото (%s)", account.username or account.phone, upload_path)
+
+            # MediaAreaUrl — кликабельная зона поверх нарисованной кнопки
             pos_map = {"top": 20.0, "center": 50.0, "bottom": 80.0}
             y = pos_map.get(template.button_pos or "bottom", 80.0)
             area = MediaAreaUrl(
                 coordinates=MediaAreaCoordinates(
-                    x=30.0,
+                    x=20.0,
                     y=y,
-                    w=40.0,
+                    w=60.0,
                     h=10.0,
                     rotation=0.0,
                 ),
@@ -1180,10 +1338,28 @@ async def _publish_story(account: TgAccount, template: StoryTemplate, users: lis
             )
             media_areas.append(area)
             logger.info(
-                "[STORY] @%s: кнопка pos=%s y=%.0f url=%s",
-                account.username or account.phone,
-                template.button_pos, y, button_url,
+                "[STORY] @%s: кнопка url=%s pos=%s",
+                account.username or account.phone, button_url, template.button_pos,
             )
+
+        # Устанавливаем TTL для каждого пользователя из списка
+        # Если у кого-то не удалось — заменяем на другого
+        if users:
+            users = await _prepare_users_for_story(tc, account, users)
+            if not users:
+                logger.warning("[STORY] @%s: все пользователи недоступны, пропускаем", account.username or account.phone)
+                return False
+
+            # Пересобираем caption с актуальным списком
+            mentions = [f"@{u.username}" for u in users if u.username]
+            texts_list = json.loads(template.texts or "[]")
+            base_caption = random.choice(texts_list) if texts_list else ""
+            mid     = len(mentions) // 2
+            caption = f"{base_caption}\n\n{' '.join(mentions[:mid])}\n{' '.join(mentions[mid:])}".strip()
+
+        logger.info("[STORY] @%s: загружаю %s", account.username or account.phone, upload_path)
+        uploaded = await tc.upload_file(upload_path)
+        media    = InputMediaUploadedPhoto(file=uploaded)
 
         # Отправляем сторис
         await tc(tl_functions.stories.SendStoryRequest(
