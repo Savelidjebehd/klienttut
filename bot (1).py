@@ -27,8 +27,6 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
 import urllib.parse
-import io as _io
-from PIL import Image, ImageDraw, ImageFont
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -1106,74 +1104,6 @@ async def _get_telethon_client(account: TgAccount) -> Optional[TelegramClient]:
         return None
 
 
-def _draw_button_on_photo(photo_path: str, button_text: str, position: str) -> str:
-    """
-    Рисует белую кнопку с голубым текстом поверх фото.
-    Возвращает путь к временному файлу с кнопкой.
-    Это нужно потому что MediaAreaUrl не поддерживает кастомный цвет кнопки —
-    Telegram всегда показывает её прозрачной.
-    """
-    try:
-        img = Image.open(photo_path).convert("RGBA")
-        w, h = img.size
-
-        draw = ImageDraw.Draw(img)
-
-        # Размеры кнопки — 60% ширины, 8% высоты
-        btn_w = int(w * 0.60)
-        btn_h = int(h * 0.085)
-        btn_r = int(btn_h * 0.35)  # скругление углов
-
-        # Позиция кнопки по вертикали
-        pos_map = {"top": 0.18, "center": 0.48, "bottom": 0.78}
-        y_center = pos_map.get(position or "bottom", 0.78)
-        btn_x = (w - btn_w) // 2
-        btn_y = int(h * y_center) - btn_h // 2
-
-        # Рисуем белую кнопку со скруглёнными углами
-        _draw_rounded_rect(draw, btn_x, btn_y, btn_w, btn_h, btn_r,
-                           fill=(255, 255, 255, 230))
-
-        # Голубой текст
-        text_color = (0, 136, 204, 255)  # Telegram blue
-        font_size  = max(18, btn_h // 2)
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-        except Exception:
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", font_size)
-            except Exception:
-                font = ImageFont.load_default()
-
-        # Центрируем текст
-        bbox = draw.textbbox((0, 0), button_text, font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        text_x = btn_x + (btn_w - text_w) // 2
-        text_y = btn_y + (btn_h - text_h) // 2
-
-        draw.text((text_x, text_y), button_text, font=font, fill=text_color)
-
-        # Сохраняем во временный файл
-        out_path = photo_path.replace(".jpg", "_btn.jpg").replace(".jpeg", "_btn.jpeg").replace(".png", "_btn.png")
-        img.convert("RGB").save(out_path, "JPEG", quality=92)
-        return out_path
-
-    except Exception as exc:
-        logger.warning("[BTN DRAW] Ошибка рисования кнопки: %s", exc)
-        return photo_path  # возвращаем оригинал если что-то пошло не так
-
-
-def _draw_rounded_rect(draw, x, y, w, h, r, fill):
-    """Рисует прямоугольник со скруглёнными углами."""
-    draw.rectangle([x + r, y, x + w - r, y + h], fill=fill)
-    draw.rectangle([x, y + r, x + w, y + h - r], fill=fill)
-    draw.ellipse([x, y, x + 2*r, y + 2*r], fill=fill)
-    draw.ellipse([x + w - 2*r, y, x + w, y + 2*r], fill=fill)
-    draw.ellipse([x, y + h - 2*r, x + 2*r, y + h], fill=fill)
-    draw.ellipse([x + w - 2*r, y + h - 2*r, x + w, y + h], fill=fill)
-
-
 def _build_button_url(account: TgAccount, template: StoryTemplate) -> Optional[str]:
     """
     Формирует URL кнопки в формате https://t.me/username?text=encoded_text
@@ -1221,30 +1151,28 @@ async def _publish_story(account: TgAccount, template: StoryTemplate, users: lis
             mid      = len(mentions) // 2
             caption  = f"{caption}\n\n{' '.join(mentions[:mid])}\n{' '.join(mentions[mid:])}".strip()
 
-        # Локальный файл → рисуем кнопку → Telethon upload_file
+        # Локальный файл → Telethon upload_file
         photo_path = random.choice(photo_paths)
         if not os.path.exists(photo_path):
             logger.error("[STORY] @%s: файл не найден: %s", account.username or account.phone, photo_path)
+            await tc.disconnect()
             return False
 
-        button_url  = _build_button_url(account, template)
+        logger.info("[STORY] @%s: загружаю %s", account.username or account.phone, photo_path)
+        uploaded = await tc.upload_file(photo_path)
+        media    = InputMediaUploadedPhoto(file=uploaded)
+
+        # Кнопка MediaAreaUrl (координаты 0–100)
         media_areas = []
-        upload_path = photo_path  # по умолчанию оригинал
-
+        button_url  = _build_button_url(account, template)
         if button_url:
-            # Рисуем белую кнопку с голубым текстом прямо на фото
-            btn_text    = template.button_text or "Написать"
-            upload_path = _draw_button_on_photo(photo_path, btn_text, template.button_pos or "bottom")
-            logger.info("[STORY] @%s: кнопка нарисована на фото (%s)", account.username or account.phone, upload_path)
-
-            # MediaAreaUrl — кликабельная зона поверх нарисованной кнопки
             pos_map = {"top": 20.0, "center": 50.0, "bottom": 80.0}
             y = pos_map.get(template.button_pos or "bottom", 80.0)
             area = MediaAreaUrl(
                 coordinates=MediaAreaCoordinates(
-                    x=20.0,
+                    x=30.0,
                     y=y,
-                    w=60.0,
+                    w=40.0,
                     h=10.0,
                     rotation=0.0,
                 ),
@@ -1252,13 +1180,10 @@ async def _publish_story(account: TgAccount, template: StoryTemplate, users: lis
             )
             media_areas.append(area)
             logger.info(
-                "[STORY] @%s: кнопка url=%s pos=%s",
-                account.username or account.phone, button_url, template.button_pos,
+                "[STORY] @%s: кнопка pos=%s y=%.0f url=%s",
+                account.username or account.phone,
+                template.button_pos, y, button_url,
             )
-
-        logger.info("[STORY] @%s: загружаю %s", account.username or account.phone, upload_path)
-        uploaded = await tc.upload_file(upload_path)
-        media    = InputMediaUploadedPhoto(file=uploaded)
 
         # Отправляем сторис
         await tc(tl_functions.stories.SendStoryRequest(
