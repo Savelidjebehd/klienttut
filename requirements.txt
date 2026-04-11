@@ -10,3 +10,4 @@ lxml==5.2.1
 pyrogram==2.0.106
 tgcrypto
 sqlalchemy==2.0.0
+Pillow
