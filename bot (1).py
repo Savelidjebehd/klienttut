@@ -45,7 +45,7 @@ from pyrogram import Client as PyrogramClient
 from pyrogram import enums as pyrogram_enums
 from pyrogram import types as pyrogram_types
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler,
@@ -1648,11 +1648,35 @@ async def show_next_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S_SHOW_CLIENT
     context.user_data["cid"] = row.id
     stages = db_get_stages(sid)
-    lines  = [f"<b>@{row.username}</b>\n", f"<b>{sname}</b>"]
+
+    lines = [f"<b>@{row.username}</b>\n", f"<b>{sname}</b>"]
     for i, st in enumerate(stages, 1):
         lines.append(f"\n<b>{i} этап — {st.description}</b>")
         lines.append(f"<blockquote>{st.script}</blockquote>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=kb_client())
+
+    # Inline кнопка "Написать" — ведёт в ЛС с предзаполненным текстом из 1-го этапа
+    inline_markup = None
+    if row.username and stages:
+        first_script = stages[0].script.strip()
+        # Обрезаем до 256 символов — лимит Telegram для параметра text в URL
+        encoded_text = urllib.parse.quote(first_script[:256], safe="")
+        url = f"https://t.me/{row.username}?text={encoded_text}"
+        inline_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✉️ Написать", url=url)]
+        ])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=kb_client(),
+    )
+    # Inline кнопка отправляется отдельным сообщением чтобы не конфликтовала с reply keyboard
+    if inline_markup:
+        await update.message.reply_text(
+            f"Написать @{row.username}:",
+            reply_markup=inline_markup,
+        )
+
     if db_count_available_clients(sid) < LOW_CLIENTS and sid not in _collecting:
         asyncio.create_task(_fill_buffer_bg(sid))
     return S_SHOW_CLIENT
